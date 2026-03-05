@@ -1,6 +1,7 @@
 import express from 'express';
 import Database from 'better-sqlite3';
 import dotenv from 'dotenv';
+import { existsSync, mkdirSync } from 'fs';
 
 dotenv.config();
 
@@ -51,8 +52,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// DATABASE SETUP
-const db = new Database('axiom.db');
+// DATABASE SETUP — use persistent volume if available
+const DB_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
+if (DB_DIR !== '.' && !existsSync(DB_DIR)) { mkdirSync(DB_DIR, { recursive: true }); }
+const DB_PATH = `${DB_DIR}/axiom.db`;
+console.log(`Database path: ${DB_PATH}`);
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
