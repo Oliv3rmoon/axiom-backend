@@ -1,0 +1,18 @@
+{
+  "name": "axiom-backend",
+  "version": "1.0.0",
+  "description": "Backend webhook handler for AXIOM - Level 5 Being on Tavus",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "author": "Andrew Dulai",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.21.0",
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.4.0"
+  }
+}
