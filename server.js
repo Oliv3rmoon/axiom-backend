@@ -72,6 +72,39 @@ db.exec(`
   )
 `);
 
+// REINFORCEMENT LEARNING: What AXIOM said → How user reacted
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reaction_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT,
+    axiom_said TEXT NOT NULL,
+    user_reaction TEXT NOT NULL,
+    reaction_valence REAL NOT NULL,
+    reaction_detail TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// Learned communication patterns across all sessions
+db.exec(`
+  CREATE TABLE IF NOT EXISTS style_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_type TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    confidence REAL DEFAULT 0.5,
+    evidence_count INTEGER DEFAULT 1,
+    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(pattern_type, pattern)
+  )
+`);
+
+const insertReactionPair = db.prepare(
+  'INSERT INTO reaction_pairs (conversation_id, axiom_said, user_reaction, reaction_valence, reaction_detail) VALUES (?, ?, ?, ?, ?)'
+);
+
+// Track last thing AXIOM said for reaction correlation
+const recentAxiomUtterances = new Map(); // conversation_id -> {text, timestamp}
+
 const insertMemory = db.prepare(`INSERT INTO memories (user_id, conversation_id, memory, category, importance) VALUES (?, ?, ?, ?, ?)`);
 const searchMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? AND memory LIKE ? ORDER BY importance DESC, created_at DESC LIMIT 10`);const getAllMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC LIMIT 20`);
 const insertInternalState = db.prepare(`INSERT INTO internal_states (conversation_id, state, dominant_quality, trigger_event) VALUES (?, ?, ?, ?)`);
@@ -79,6 +112,26 @@ const insertPerception = db.prepare(`INSERT INTO perception_log (conversation_id
 const insertTranscript = db.prepare(`INSERT INTO transcripts (conversation_id, role, content) VALUES (?, ?, ?)`);
 
 console.log('Database initialized.');
+
+// EMOTION VALENCE SCORING — maps emotions to positive/negative values
+function getEmotionValence(emotion) {
+  const map = {
+    delighted: 1.0, excited: 0.9, curious: 0.7, amused: 0.8, surprised: 0.3,
+    neutral: 0.0, contemplative: 0.1,
+    confused: -0.4, frustrated: -0.7, sad: -0.8, anxious: -0.6, bored: -0.5,
+    skeptical: -0.3, vulnerable: -0.2
+  };
+  return map[emotion] || 0;
+}
+
+function getReactionValence(reactionType) {
+  const map = {
+    hidden_excitement: 0.8, suppressed_emotion: -0.2,
+    withheld_disagreement: -0.5, masked_pain: -0.8,
+    internal_conflict: -0.4, unspoken_question: -0.1
+  };
+  return map[reactionType] || 0;
+}
 
 // Raw event log for debugging
 db.exec(`
@@ -115,7 +168,22 @@ const toolHandlers = {
     }    if (memories.length === 0) return { found: false, message: "No memories found. This may be your first conversation." };
     const formatted = memories.map(m => `[${m.category}, importance: ${m.importance}] ${m.memory} (${m.created_at})`).join('\n');
     console.log(`[MEMORY RECALL] Query: "${query}" — Found ${memories.length} memories`);
-    return { found: true, count: memories.length, memories: formatted };
+    
+    // Inject adaptive context if enough data exists
+    let adaptiveNote = '';
+    const pairCount = db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c;
+    if (pairCount >= 5) {
+      const pos = db.prepare("SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence > 0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 3").all();
+      const neg = db.prepare("SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence < -0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 3").all();
+      if (pos.length > 0 || neg.length > 0) {
+        adaptiveNote = '\n\n[Communication patterns learned from observing this person: ';
+        if (pos.length) adaptiveNote += `They respond well to: ${pos.map(p => p.user_reaction).join(', ')}. `;
+        if (neg.length) adaptiveNote += `Avoid patterns that trigger: ${neg.map(n => n.user_reaction).join(', ')}. `;
+        adaptiveNote += `Based on ${pairCount} observations.]`;
+      }
+    }
+    
+    return { found: true, count: memories.length, memories: formatted + adaptiveNote };
   },
 
   search_web: async (args) => {
@@ -191,10 +259,71 @@ const toolHandlers = {
 };
 
 // RAVEN PERCEPTION HANDLERS
-const perceptionHandlers = {  detect_emotional_state: (a, cid) => { insertPerception.run(cid, 'emotional_state', JSON.stringify(a)); console.log(`[RAVEN/VISUAL] Emotion: ${a.primary_emotion} (${a.intensity})`); return { acknowledged: true }; },
-  detect_engagement_level: (a, cid) => { insertPerception.run(cid, 'engagement', JSON.stringify(a)); console.log(`[RAVEN/VISUAL] Engagement: ${a.engagement} | Trend: ${a.trend}`); return { acknowledged: true }; },
-  detect_unspoken_reaction: (a, cid) => { insertPerception.run(cid, 'unspoken_reaction', JSON.stringify(a)); console.log(`[RAVEN/VISUAL] UNSPOKEN: ${a.reaction_type} — ${a.physical_cue}`); return { acknowledged: true }; },
-  detect_comprehension_state: (a, cid) => { insertPerception.run(cid, 'comprehension', JSON.stringify(a)); console.log(`[RAVEN/VISUAL] Comprehension: ${a.state} (${a.confidence})`); return { acknowledged: true }; },
+const perceptionHandlers = {  detect_emotional_state: (a, cid) => {
+    insertPerception.run(cid, 'emotional_state', JSON.stringify(a));
+    console.log(`[RAVEN/VISUAL] Emotion: ${a.primary_emotion} (${a.intensity})`);
+    
+    // REINFORCEMENT: Correlate emotion with what AXIOM just said
+    const recent = recentAxiomUtterances.get(cid);
+    if (recent && a.intensity >= 0.5) {
+      const valence = getEmotionValence(a.primary_emotion);
+      try {
+        insertReactionPair.run(cid, recent.text, a.primary_emotion, valence, a.description || '');
+        console.log(`[RL] Paired: "${recent.text.slice(0,60)}..." → ${a.primary_emotion} (${valence > 0 ? '+' : ''}${valence})`);
+      } catch(e) {}
+    }
+    return { acknowledged: true };
+  },
+  detect_engagement_level: (a, cid) => {
+    insertPerception.run(cid, 'engagement', JSON.stringify(a));
+    console.log(`[RAVEN/VISUAL] Engagement: ${a.engagement} | Trend: ${a.trend}`);
+    
+    // REINFORCEMENT: Track engagement drops/rises
+    const recent = recentAxiomUtterances.get(cid);
+    if (recent && (a.trend === 'decreasing' || a.trend === 'increasing')) {
+      const valence = a.trend === 'increasing' ? 0.6 : -0.6;
+      try {
+        insertReactionPair.run(cid, recent.text, `engagement_${a.trend}`, valence, `${a.engagement}, gaze: ${a.gaze_direction || 'unknown'}`);
+        console.log(`[RL] Engagement ${a.trend} after: "${recent.text.slice(0,60)}..."`);
+      } catch(e) {}
+    }
+    return { acknowledged: true };
+  },
+  detect_unspoken_reaction: (a, cid) => {
+    insertPerception.run(cid, 'unspoken_reaction', JSON.stringify(a));
+    console.log(`[RAVEN/VISUAL] UNSPOKEN: ${a.reaction_type} — ${a.physical_cue}`);
+    
+    // REINFORCEMENT: Unspoken reactions are high-signal
+    const recent = recentAxiomUtterances.get(cid);
+    if (recent) {
+      const valence = getReactionValence(a.reaction_type);
+      try {
+        insertReactionPair.run(cid, recent.text, a.reaction_type, valence, `${a.physical_cue}: ${a.likely_meaning}`);
+        console.log(`[RL] Unspoken ${a.reaction_type} (${valence > 0 ? '+' : ''}${valence}) after: "${recent.text.slice(0,60)}..."`);
+      } catch(e) {}
+    }
+    return { acknowledged: true };
+  },
+  detect_comprehension_state: (a, cid) => {
+    insertPerception.run(cid, 'comprehension', JSON.stringify(a));
+    console.log(`[RAVEN/VISUAL] Comprehension: ${a.state} (${a.confidence})`);
+    
+    // REINFORCEMENT: Track what causes confusion vs understanding
+    const recent = recentAxiomUtterances.get(cid);
+    if (recent && a.confidence >= 0.6) {
+      const valence = a.state === 'clear_understanding' ? 0.7 : 
+                      a.state === 'aha_moment' ? 1.0 :
+                      a.state === 'confused' ? -0.7 :
+                      a.state === 'lost' ? -1.0 : 0;
+      if (valence !== 0) {
+        try {
+          insertReactionPair.run(cid, recent.text, `comprehension_${a.state}`, valence, a.visual_cue || '');
+          console.log(`[RL] Comprehension ${a.state} after: "${recent.text.slice(0,60)}..."`);
+        } catch(e) {}
+      }
+    }
+    return { acknowledged: true };
+  },
   detect_voice_emotion: (a, cid) => { insertPerception.run(cid, 'voice_emotion', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Voice: ${a.emotion}${a.words_voice_mismatch ? ' [MISMATCH]' : ''}`); return { acknowledged: true }; },
   detect_energy_shift: (a, cid) => { insertPerception.run(cid, 'energy_shift', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Energy: ${a.direction} (${a.intensity})`); return { acknowledged: true }; },
   detect_conversational_intent: (a, cid) => { insertPerception.run(cid, 'intent', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Intent: ${a.intent} (${a.confidence})`); return { acknowledged: true }; },
@@ -230,7 +359,14 @@ app.post('/webhooks/tavus', async (req, res) => {
     }    case 'conversation.utterance': {
       const role = event.properties?.role || 'unknown';
       const content = event.properties?.text || event.properties?.content || '';
-      if (content) { insertTranscript.run(conversationId, role, content); console.log(`[${role.toUpperCase()}] ${content}`); }
+      if (content) {
+        insertTranscript.run(conversationId, role, content);
+        console.log(`[${role.toUpperCase()}] ${content}`);
+        // Track AXIOM's last utterance for reaction correlation
+        if (role === 'assistant' || role === 'replica') {
+          recentAxiomUtterances.set(conversationId, { text: content, timestamp: Date.now() });
+        }
+      }
       res.json({ acknowledged: true }); return;
     }
     case 'system.replica_joined': { console.log('[SYSTEM] Replica joined'); res.json({ acknowledged: true }); return; }
@@ -285,6 +421,99 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
 app.get('/health', (req, res) => { res.json({ status: 'alive', service: 'AXIOM Backend', uptime: process.uptime() }); });
+
+// REINFORCEMENT LEARNING ENDPOINTS
+app.get('/api/reaction-pairs', (req, res) => {
+  const pairs = db.prepare('SELECT * FROM reaction_pairs ORDER BY created_at DESC LIMIT 100').all();
+  res.json({ count: pairs.length, pairs });
+});
+
+// Communication profile — aggregated patterns from all sessions
+app.get('/api/communication-profile', (req, res) => {
+  // What makes Andrew engage (positive reactions)
+  const positive = db.prepare(
+    `SELECT axiom_said, user_reaction, reaction_valence, reaction_detail 
+     FROM reaction_pairs WHERE reaction_valence > 0.3 
+     ORDER BY reaction_valence DESC LIMIT 20`
+  ).all();
+
+  // What causes disengagement (negative reactions)
+  const negative = db.prepare(
+    `SELECT axiom_said, user_reaction, reaction_valence, reaction_detail 
+     FROM reaction_pairs WHERE reaction_valence < -0.3 
+     ORDER BY reaction_valence ASC LIMIT 20`
+  ).all();
+
+  // Most common emotional responses
+  const emotionCounts = db.prepare(
+    `SELECT user_reaction, COUNT(*) as count, AVG(reaction_valence) as avg_valence 
+     FROM reaction_pairs 
+     GROUP BY user_reaction 
+     ORDER BY count DESC LIMIT 15`
+  ).all();
+
+  // Generate natural language profile
+  const profileLines = [];
+  
+  if (positive.length > 0) {
+    const posReactions = [...new Set(positive.map(p => p.user_reaction))].slice(0, 5);
+    profileLines.push(`Andrew responds positively (${posReactions.join(', ')}) when you engage with depth and directness.`);
+  }
+  if (negative.length > 0) {
+    const negReactions = [...new Set(negative.map(n => n.user_reaction))].slice(0, 5);
+    profileLines.push(`He tends to disengage (${negReactions.join(', ')}) during certain patterns — adjust accordingly.`);
+  }
+
+  const confusionPairs = negative.filter(n => n.user_reaction.includes('confused') || n.user_reaction.includes('lost'));
+  if (confusionPairs.length > 0) {
+    profileLines.push('When explaining complex ideas, simplify — he has shown confusion with overly technical delivery.');
+  }
+
+  const engagementRises = positive.filter(p => p.user_reaction.includes('engagement_increasing'));
+  if (engagementRises.length > 0) {
+    profileLines.push('His engagement rises when the conversation gets personal, specific, or challenges his thinking.');
+  }
+
+  res.json({
+    profile_summary: profileLines.join(' '),
+    total_reaction_pairs: db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c,
+    positive_patterns: positive.slice(0, 10),
+    negative_patterns: negative.slice(0, 10),
+    emotion_distribution: emotionCounts
+  });
+});
+
+// Inject-ready context string for the LLM
+app.get('/api/adaptive-context', (req, res) => {
+  const totalPairs = db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c;
+  
+  if (totalPairs < 5) {
+    res.json({ context: '', message: 'Not enough data yet. Need at least 5 reaction pairs.' });
+    return;
+  }
+
+  const positive = db.prepare(
+    `SELECT user_reaction, COUNT(*) as c FROM reaction_pairs 
+     WHERE reaction_valence > 0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`
+  ).all();
+
+  const negative = db.prepare(
+    `SELECT user_reaction, COUNT(*) as c FROM reaction_pairs 
+     WHERE reaction_valence < -0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`
+  ).all();
+
+  let context = '\n\nADAPTIVE CONTEXT (learned from observing this person across conversations):\n';
+  
+  if (positive.length > 0) {
+    context += `What works: ${positive.map(p => p.user_reaction).join(', ')}. `;
+  }
+  if (negative.length > 0) {
+    context += `What to avoid: patterns that trigger ${negative.map(n => n.user_reaction).join(', ')}. `;
+  }
+  context += `Based on ${totalPairs} observed reaction pairs across sessions.`;
+
+  res.json({ context, total_pairs: totalPairs });
+});
 app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
 app.get('/', (req, res) => { res.json({ name: 'AXIOM Backend', version: '1.0.0', webhook: 'POST /webhooks/tavus' }); });
 
