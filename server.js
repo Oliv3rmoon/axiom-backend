@@ -225,6 +225,34 @@ app.post('/webhooks/tavus', async (req, res) => {
   }
 });
 
+// CREATE CONVERSATION (proxy to avoid CORS issues in browser)
+app.post('/api/create-conversation', async (req, res) => {
+  try {
+    const tavusRes = await fetch('https://tavusapi.com/v2/conversations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.TAVUS_API_KEY
+      },
+      body: JSON.stringify({
+        persona_id: req.body.persona_id || 'pef833bbe975',
+        callback_url: `https://axiom-backend-production-dfba.up.railway.app/webhooks/tavus`,
+        properties: {
+          max_call_duration: 3600,
+          enable_recording: true,
+          enable_transcription: true
+        }
+      })
+    });
+    const data = await tavusRes.json();
+    console.log(`[CONVERSATION CREATED] ${data.conversation_id} | ${data.conversation_url}`);
+    res.json(data);
+  } catch (e) {
+    console.error('[CREATE ERROR]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // API ENDPOINTS
 app.get('/api/memories', (req, res) => { res.json({ memories: getAllMemories.all('andrew') }); });
 app.get('/api/internal-states', (req, res) => { res.json({ states: db.prepare('SELECT * FROM internal_states ORDER BY created_at DESC LIMIT 50').all() }); });
