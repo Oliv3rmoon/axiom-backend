@@ -4,6 +4,31 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const FACE_SERVICE_URL = process.env.FACE_SERVICE_URL || '';
+
+// Face identification helper
+async function identifyFace(frameData, conversationId) {
+  if (!FACE_SERVICE_URL) return null;
+  try {
+    const res = await fetch(`${FACE_SERVICE_URL}/identify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frame: frameData, conversation_id: conversationId }),
+    });
+    const data = await res.json();
+    if (data.faces && data.faces.length > 0) {
+      const identified = data.faces.filter(f => f.name !== 'unknown');
+      const unknown = data.faces.filter(f => f.name === 'unknown');
+      console.log(`[FACE ID] ${identified.map(f => `${f.name} (${f.confidence})`).join(', ') || 'no matches'} | ${unknown.length} unknown`);
+      return data;
+    }
+    return null;
+  } catch (e) {
+    console.error('[FACE ERROR]', e.message);
+    return null;
+  }
+}
+
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
@@ -380,6 +405,37 @@ app.post('/webhooks/tavus', async (req, res) => {
     }
     default: { console.log(`[UNHANDLED] ${eventType}`); res.json({ acknowledged: true }); }
   }
+});
+
+// FACE IDENTIFICATION — proxy to Python face service
+app.post('/api/identify-face', async (req, res) => {
+  if (!FACE_SERVICE_URL) return res.json({ error: 'Face service not configured' });
+  const result = await identifyFace(req.body.frame, req.body.conversation_id);
+  res.json(result || { faces: [], count: 0 });
+});
+
+// FACE REGISTRATION — register a new face
+app.post('/api/register-face', async (req, res) => {
+  if (!FACE_SERVICE_URL) return res.json({ error: 'Face service not configured' });
+  try {
+    const r = await fetch(`${FACE_SERVICE_URL}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: req.body.name, frame: req.body.frame }),
+    });
+    const data = await r.json();
+    console.log(`[FACE REG] ${data.name} — ${data.action}`);
+    res.json(data);
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+// KNOWN FACES list
+app.get('/api/faces', async (req, res) => {
+  if (!FACE_SERVICE_URL) return res.json({ faces: [] });
+  try {
+    const r = await fetch(`${FACE_SERVICE_URL}/faces`);
+    res.json(await r.json());
+  } catch (e) { res.json({ faces: [] }); }
 });
 
 // CREATE CONVERSATION (proxy to avoid CORS issues in browser)
