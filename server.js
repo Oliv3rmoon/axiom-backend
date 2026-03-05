@@ -7,6 +7,16 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// LOG EVERY INCOMING REQUEST for debugging
+app.use((req, res, next) => {
+  if (req.method === 'POST') {
+    console.log(`\n>>> INCOMING ${req.method} ${req.path}`);
+    console.log(`>>> Headers: ${JSON.stringify(req.headers).slice(0, 300)}`);
+    console.log(`>>> Body: ${JSON.stringify(req.body).slice(0, 1000)}`);
+  }
+  next();
+});
+
 // DATABASE SETUP
 const db = new Database('axiom.db');
 db.pragma('journal_mode = WAL');
@@ -60,6 +70,17 @@ const insertPerception = db.prepare(`INSERT INTO perception_log (conversation_id
 const insertTranscript = db.prepare(`INSERT INTO transcripts (conversation_id, role, content) VALUES (?, ?, ?)`);
 
 console.log('Database initialized.');
+
+// Raw event log for debugging
+db.exec(`
+  CREATE TABLE IF NOT EXISTS raw_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT,
+    body TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+const insertRawEvent = db.prepare(`INSERT INTO raw_events (path, body) VALUES (?, ?)`);
 
 // TOOL HANDLERS
 const toolHandlers = {
@@ -153,6 +174,10 @@ const perceptionHandlers = {  detect_emotional_state: (a, cid) => { insertPercep
 // MAIN WEBHOOK ENDPOINT
 app.post('/webhooks/tavus', async (req, res) => {
   const event = req.body;
+  
+  // Log EVERYTHING raw for debugging
+  try { insertRawEvent.run('/webhooks/tavus', JSON.stringify(event)); } catch(e) {}
+  
   const eventType = event.event_type || event.type || 'unknown';
   const conversationId = event.conversation_id || 'unknown';
   console.log(`\n${'='.repeat(50)}\n[EVENT] ${eventType} | ${conversationId}\n${'='.repeat(50)}`);
@@ -202,7 +227,16 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
 app.get('/health', (req, res) => { res.json({ status: 'alive', service: 'AXIOM Backend', uptime: process.uptime() }); });
+app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
 app.get('/', (req, res) => { res.json({ name: 'AXIOM Backend', version: '1.0.0', webhook: 'POST /webhooks/tavus' }); });
+
+// CATCH-ALL for any other POST — in case Tavus sends to a different path
+app.post('*', (req, res) => {
+  console.log(`\n[CATCH-ALL] POST to ${req.path}`);
+  console.log(JSON.stringify(req.body).slice(0, 1000));
+  try { insertRawEvent.run(req.path, JSON.stringify(req.body)); } catch(e) {}
+  res.json({ acknowledged: true });
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════╗`);
