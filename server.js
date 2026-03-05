@@ -121,6 +121,7 @@ const toolHandlers = {
   search_web: async (args) => {
     const { query } = args;
     console.log(`[WEB SEARCH] Query: "${query}"`);
+    // Option 1: SerpAPI (100 free/month)
     if (process.env.SERP_API_KEY && process.env.SERP_API_KEY !== 'your_serp_api_key_here') {
       try {
         const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${process.env.SERP_API_KEY}&num=5`;
@@ -129,8 +130,28 @@ const toolHandlers = {
         if (data.organic_results) {
           return { success: true, query, results: data.organic_results.slice(0, 5).map(r => `${r.title}: ${r.snippet}`).join('\n\n') };
         }
-      } catch (e) { console.error('[SEARCH ERROR]', e.message); }
+        if (data.answer_box) {
+          return { success: true, query, results: data.answer_box.answer || data.answer_box.snippet || JSON.stringify(data.answer_box) };
+        }
+      } catch (e) { console.error('[SERP ERROR]', e.message); }
     }
+    // Option 2: DuckDuckGo lite (HTML scraping fallback)
+    try {
+      const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const html = await r.text();
+      const snippets = [];
+      const regex = /class="result-snippet">(.*?)<\/td/gs;
+      let match;
+      while ((match = regex.exec(html)) !== null && snippets.length < 5) {
+        const clean = match[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&quot;/g, '"').trim();
+        if (clean.length > 20) snippets.push(clean);
+      }
+      if (snippets.length > 0) {
+        return { success: true, query, results: snippets.join('\n\n'), source: 'DuckDuckGo' };
+      }
+    } catch (e) { console.error('[DDG LITE ERROR]', e.message); }
+    // Option 3: DuckDuckGo instant answer
     try {
       const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
       const r = await fetch(url);
@@ -140,7 +161,7 @@ const toolHandlers = {
         return { success: true, query, results: data.RelatedTopics.filter(t => t.Text).slice(0, 5).map(t => t.Text).join('\n\n') || 'No results.' };
       }
     } catch (e) { console.error('[DDG ERROR]', e.message); }
-    return { success: false, query, results: 'Search failed. Rely on existing knowledge.' };
+    return { success: false, query, results: 'Could not find current information on this topic. Answer based on your existing knowledge and let the user know the information may not be fully up to date.' };
   },
   get_current_time: (args) => {
     const tz = args.timezone || 'America/Los_Angeles';
