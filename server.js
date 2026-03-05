@@ -455,6 +455,7 @@ app.post('/api/create-conversation', async (req, res) => {
       body: JSON.stringify({
         persona_id: req.body.persona_id || 'pef833bbe975',
         callback_url: `https://axiom-backend-production-dfba.up.railway.app/webhooks/tavus`,
+        conversational_context: req.body.conversational_context || '',
         properties: {
           max_call_duration: 3600,
           enable_recording: true,
