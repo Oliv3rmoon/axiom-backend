@@ -7,6 +7,15 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// CORS — allow frontend to call backend
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
+  next();
+});
+
 // LOG EVERY INCOMING REQUEST for debugging
 app.use((req, res, next) => {
   if (req.method === 'POST') {
