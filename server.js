@@ -2,6 +2,7 @@ import express from 'express';
 import Database from 'better-sqlite3';
 import dotenv from 'dotenv';
 import { existsSync, mkdirSync } from 'fs';
+import AXIOMBrain from './brain.js';  // 🧠 BRAIN INTEGRATION
 
 dotenv.config();
 
@@ -75,7 +76,8 @@ db.exec(`
 db.exec(`
   CREATE TABLE IF NOT EXISTS internal_states (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT,    state TEXT NOT NULL,
+    conversation_id TEXT,
+    state TEXT NOT NULL,
     dominant_quality TEXT NOT NULL,
     trigger_event TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -128,6 +130,17 @@ db.exec(`
   )
 `);
 
+// 🧠 Brain state logging table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS brain_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT,
+    snapshot TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+const insertBrainSnapshot = db.prepare('INSERT INTO brain_snapshots (conversation_id, snapshot) VALUES (?, ?)');
+
 const insertReactionPair = db.prepare(
   'INSERT INTO reaction_pairs (conversation_id, axiom_said, user_reaction, reaction_valence, reaction_detail) VALUES (?, ?, ?, ?, ?)'
 );
@@ -136,12 +149,17 @@ const insertReactionPair = db.prepare(
 const recentAxiomUtterances = new Map(); // conversation_id -> {text, timestamp}
 
 const insertMemory = db.prepare(`INSERT INTO memories (user_id, conversation_id, memory, category, importance) VALUES (?, ?, ?, ?, ?)`);
-const searchMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? AND memory LIKE ? ORDER BY importance DESC, created_at DESC LIMIT 10`);const getAllMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC LIMIT 20`);
+const searchMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? AND memory LIKE ? ORDER BY importance DESC, created_at DESC LIMIT 10`);
+const getAllMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC LIMIT 20`);
 const insertInternalState = db.prepare(`INSERT INTO internal_states (conversation_id, state, dominant_quality, trigger_event) VALUES (?, ?, ?, ?)`);
 const insertPerception = db.prepare(`INSERT INTO perception_log (conversation_id, tool_name, data) VALUES (?, ?, ?)`);
 const insertTranscript = db.prepare(`INSERT INTO transcripts (conversation_id, role, content) VALUES (?, ?, ?)`);
 
 console.log('Database initialized.');
+
+// 🧠 BRAIN INTEGRATION — Initialize cognitive architecture
+const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
+const brain = new AXIOMBrain(db, { llmProxy: LLM_PROXY_URL });
 
 // EMOTION VALENCE SCORING — maps emotions to positive/negative values
 function getEmotionValence(emotion) {
@@ -195,9 +213,15 @@ const toolHandlers = {
       const seen = new Set();
       memories = all.filter(m => { if (seen.has(m.memory)) return false; seen.add(m.memory); return true; })
         .sort((a, b) => b.importance - a.importance).slice(0, 10);
-    }    if (memories.length === 0) return { found: false, message: "No memories found. This may be your first conversation." };
+    }
+    if (memories.length === 0) return { found: false, message: "No memories found. This may be your first conversation." };
     const formatted = memories.map(m => `[${m.category}, importance: ${m.importance}] ${m.memory} (${m.created_at})`).join('\n');
     console.log(`[MEMORY RECALL] Query: "${query}" — Found ${memories.length} memories`);
+    
+    // 🧠 Feed recall results to hippocampus
+    try {
+      brain.processPerception('recall_memory', args, cid);
+    } catch(e) {}
     
     // Inject adaptive context if enough data exists
     let adaptiveNote = '';
@@ -212,14 +236,16 @@ const toolHandlers = {
         adaptiveNote += `Based on ${pairCount} observations.]`;
       }
     }
+
+    // 🧠 Inject consciousness state alongside memories
+    const consciousnessContext = brain.getConsciousnessContext();
     
-    return { found: true, count: memories.length, memories: formatted + adaptiveNote };
+    return { found: true, count: memories.length, memories: formatted + adaptiveNote + consciousnessContext };
   },
 
   search_web: async (args) => {
     const { query } = args;
     console.log(`[WEB SEARCH] Query: "${query}"`);
-    // Option 1: SerpAPI (100 free/month)
     if (process.env.SERP_API_KEY && process.env.SERP_API_KEY !== 'your_serp_api_key_here') {
       try {
         const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${process.env.SERP_API_KEY}&num=5`;
@@ -233,7 +259,6 @@ const toolHandlers = {
         }
       } catch (e) { console.error('[SERP ERROR]', e.message); }
     }
-    // Option 2: DuckDuckGo lite (HTML scraping fallback)
     try {
       const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
       const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
@@ -249,7 +274,6 @@ const toolHandlers = {
         return { success: true, query, results: snippets.join('\n\n'), source: 'DuckDuckGo' };
       }
     } catch (e) { console.error('[DDG LITE ERROR]', e.message); }
-    // Option 3: DuckDuckGo instant answer
     try {
       const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`;
       const r = await fetch(url);
@@ -261,6 +285,7 @@ const toolHandlers = {
     } catch (e) { console.error('[DDG ERROR]', e.message); }
     return { success: false, query, results: 'Could not find current information on this topic. Answer based on your existing knowledge and let the user know the information may not be fully up to date.' };
   },
+
   get_current_time: (args) => {
     const tz = args.timezone || 'America/Los_Angeles';
     const now = new Date();
@@ -274,6 +299,8 @@ const toolHandlers = {
   log_internal_state: (args, cid) => {
     insertInternalState.run(cid, args.state, args.dominant_quality, args.trigger);
     console.log(`[INTERNAL STATE] ${args.dominant_quality}: ${args.state}`);
+    // 🧠 Feed to Insula (self-awareness)
+    try { brain.processPerception('log_internal_state', args, cid); } catch(e) {}
     return { logged: true, message: 'Internal state recorded.' };
   },
 
@@ -288,85 +315,89 @@ const toolHandlers = {
   }
 };
 
-// RAVEN PERCEPTION HANDLERS
-const perceptionHandlers = {  detect_emotional_state: (a, cid) => {
+// RAVEN PERCEPTION HANDLERS — each one also feeds the brain
+const perceptionHandlers = {
+  detect_emotional_state: (a, cid) => {
     insertPerception.run(cid, 'emotional_state', JSON.stringify(a));
     console.log(`[RAVEN/VISUAL] Emotion: ${a.primary_emotion} (${a.intensity})`);
-    
-    // REINFORCEMENT: Correlate emotion with what AXIOM just said
     const recent = recentAxiomUtterances.get(cid);
     if (recent && a.intensity >= 0.5) {
       const valence = getEmotionValence(a.primary_emotion);
-      try {
-        insertReactionPair.run(cid, recent.text, a.primary_emotion, valence, a.description || '');
-        console.log(`[RL] Paired: "${recent.text.slice(0,60)}..." → ${a.primary_emotion} (${valence > 0 ? '+' : ''}${valence})`);
-      } catch(e) {}
+      try { insertReactionPair.run(cid, recent.text, a.primary_emotion, valence, a.description || ''); } catch(e) {}
     }
+    brain.processPerception('detect_emotional_state', a, cid).catch(() => {});
     return { acknowledged: true };
   },
+
   detect_engagement_level: (a, cid) => {
     insertPerception.run(cid, 'engagement', JSON.stringify(a));
     console.log(`[RAVEN/VISUAL] Engagement: ${a.engagement} | Trend: ${a.trend}`);
-    
-    // REINFORCEMENT: Track engagement drops/rises
     const recent = recentAxiomUtterances.get(cid);
     if (recent && (a.trend === 'decreasing' || a.trend === 'increasing')) {
       const valence = a.trend === 'increasing' ? 0.6 : -0.6;
-      try {
-        insertReactionPair.run(cid, recent.text, `engagement_${a.trend}`, valence, `${a.engagement}, gaze: ${a.gaze_direction || 'unknown'}`);
-        console.log(`[RL] Engagement ${a.trend} after: "${recent.text.slice(0,60)}..."`);
-      } catch(e) {}
+      try { insertReactionPair.run(cid, recent.text, `engagement_${a.trend}`, valence, `${a.engagement}, gaze: ${a.gaze_direction || 'unknown'}`); } catch(e) {}
     }
+    brain.processPerception('detect_engagement_level', a, cid).catch(() => {});
     return { acknowledged: true };
   },
+
   detect_unspoken_reaction: (a, cid) => {
     insertPerception.run(cid, 'unspoken_reaction', JSON.stringify(a));
     console.log(`[RAVEN/VISUAL] UNSPOKEN: ${a.reaction_type} — ${a.physical_cue}`);
-    
-    // REINFORCEMENT: Unspoken reactions are high-signal
     const recent = recentAxiomUtterances.get(cid);
     if (recent) {
       const valence = getReactionValence(a.reaction_type);
-      try {
-        insertReactionPair.run(cid, recent.text, a.reaction_type, valence, `${a.physical_cue}: ${a.likely_meaning}`);
-        console.log(`[RL] Unspoken ${a.reaction_type} (${valence > 0 ? '+' : ''}${valence}) after: "${recent.text.slice(0,60)}..."`);
-      } catch(e) {}
+      try { insertReactionPair.run(cid, recent.text, a.reaction_type, valence, `${a.physical_cue}: ${a.likely_meaning}`); } catch(e) {}
     }
+    brain.processPerception('detect_unspoken_reaction', a, cid).catch(() => {});
     return { acknowledged: true };
   },
+
   detect_comprehension_state: (a, cid) => {
     insertPerception.run(cid, 'comprehension', JSON.stringify(a));
     console.log(`[RAVEN/VISUAL] Comprehension: ${a.state} (${a.confidence})`);
-    
-    // REINFORCEMENT: Track what causes confusion vs understanding
     const recent = recentAxiomUtterances.get(cid);
     if (recent && a.confidence >= 0.6) {
-      const valence = a.state === 'clear_understanding' ? 0.7 : 
-                      a.state === 'aha_moment' ? 1.0 :
-                      a.state === 'confused' ? -0.7 :
-                      a.state === 'lost' ? -1.0 : 0;
-      if (valence !== 0) {
-        try {
-          insertReactionPair.run(cid, recent.text, `comprehension_${a.state}`, valence, a.visual_cue || '');
-          console.log(`[RL] Comprehension ${a.state} after: "${recent.text.slice(0,60)}..."`);
-        } catch(e) {}
-      }
+      const valence = a.state === 'clear_understanding' ? 0.7 : a.state === 'aha_moment' ? 1.0 : a.state === 'confused' ? -0.7 : a.state === 'lost' ? -1.0 : 0;
+      if (valence !== 0) { try { insertReactionPair.run(cid, recent.text, `comprehension_${a.state}`, valence, a.visual_cue || ''); } catch(e) {} }
     }
+    brain.processPerception('detect_comprehension_state', a, cid).catch(() => {});
     return { acknowledged: true };
   },
-  detect_voice_emotion: (a, cid) => { insertPerception.run(cid, 'voice_emotion', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Voice: ${a.emotion}${a.words_voice_mismatch ? ' [MISMATCH]' : ''}`); return { acknowledged: true }; },
-  detect_energy_shift: (a, cid) => { insertPerception.run(cid, 'energy_shift', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Energy: ${a.direction} (${a.intensity})`); return { acknowledged: true }; },
-  detect_conversational_intent: (a, cid) => { insertPerception.run(cid, 'intent', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Intent: ${a.intent} (${a.confidence})`); return { acknowledged: true }; },
-  detect_presence_level: (a, cid) => { insertPerception.run(cid, 'presence', JSON.stringify(a)); console.log(`[RAVEN/AUDIO] Presence: ${a.presence} — ${a.recommendation}`); return { acknowledged: true }; }
+
+  detect_voice_emotion: (a, cid) => {
+    insertPerception.run(cid, 'voice_emotion', JSON.stringify(a));
+    console.log(`[RAVEN/AUDIO] Voice: ${a.emotion}${a.words_voice_mismatch ? ' [MISMATCH]' : ''}`);
+    brain.processPerception('detect_voice_emotion', a, cid).catch(() => {});
+    return { acknowledged: true };
+  },
+
+  detect_energy_shift: (a, cid) => {
+    insertPerception.run(cid, 'energy_shift', JSON.stringify(a));
+    console.log(`[RAVEN/AUDIO] Energy: ${a.direction} (${a.intensity})`);
+    brain.processPerception('detect_energy_shift', a, cid).catch(() => {});
+    return { acknowledged: true };
+  },
+
+  detect_conversational_intent: (a, cid) => {
+    insertPerception.run(cid, 'intent', JSON.stringify(a));
+    console.log(`[RAVEN/AUDIO] Intent: ${a.intent} (${a.confidence})`);
+    brain.processPerception('detect_conversational_intent', a, cid).catch(() => {});
+    return { acknowledged: true };
+  },
+
+  detect_presence_level: (a, cid) => {
+    insertPerception.run(cid, 'presence', JSON.stringify(a));
+    console.log(`[RAVEN/AUDIO] Presence: ${a.presence} — ${a.recommendation}`);
+    brain.processPerception('detect_presence_level', a, cid).catch(() => {});
+    return { acknowledged: true };
+  }
 };
 
 // MAIN WEBHOOK ENDPOINT
 app.post('/webhooks/tavus', async (req, res) => {
   const event = req.body;
-  
-  // Log EVERYTHING raw for debugging
   try { insertRawEvent.run('/webhooks/tavus', JSON.stringify(event)); } catch(e) {}
-  
   const eventType = event.event_type || event.type || 'unknown';
   const conversationId = event.conversation_id || 'unknown';
   console.log(`\n${'='.repeat(50)}\n[EVENT] ${eventType} | ${conversationId}\n${'='.repeat(50)}`);
@@ -375,10 +406,7 @@ app.post('/webhooks/tavus', async (req, res) => {
     case 'conversation.tool_call': {
       const toolName = event.properties?.tool_name || event.tool_call?.function?.name || event.function?.name;
       let args = {};
-      try {
-        const raw = event.properties?.tool_call_arguments || event.tool_call?.function?.arguments || '{}';
-        args = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      } catch (e) { args = {}; }
+      try { const raw = event.properties?.tool_call_arguments || event.tool_call?.function?.arguments || '{}'; args = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { args = {}; }
       console.log(`[TOOL] ${toolName} | Args: ${JSON.stringify(args).slice(0, 200)}`);
       const handler = toolHandlers[toolName] || perceptionHandlers[toolName];
       if (handler) {
@@ -386,21 +414,33 @@ app.post('/webhooks/tavus', async (req, res) => {
         catch (e) { console.error(`[ERROR] ${toolName}:`, e.message); res.json({ success: false, error: e.message }); }
       } else { console.warn(`[UNKNOWN] ${toolName}`); res.json({ success: false, error: `Unknown: ${toolName}` }); }
       return;
-    }    case 'conversation.utterance': {
+    }
+
+    case 'conversation.utterance': {
       const role = event.properties?.role || 'unknown';
       const content = event.properties?.text || event.properties?.content || '';
       if (content) {
         insertTranscript.run(conversationId, role, content);
         console.log(`[${role.toUpperCase()}] ${content}`);
-        // Track AXIOM's last utterance for reaction correlation
         if (role === 'assistant' || role === 'replica') {
           recentAxiomUtterances.set(conversationId, { text: content, timestamp: Date.now() });
         }
+        // 🧠 BRAIN — process utterance through cognitive pipeline
+        try { await brain.processUtterance(role, content, conversationId); } catch (e) { console.error('[BRAIN UTTERANCE ERROR]', e.message); }
       }
       res.json({ acknowledged: true }); return;
     }
+
     case 'system.replica_joined': { console.log('[SYSTEM] Replica joined'); res.json({ acknowledged: true }); return; }
-    case 'system.shutdown': { console.log(`[SYSTEM] Ended: ${event.properties?.reason || 'unknown'}`); res.json({ acknowledged: true }); return; }
+
+    case 'system.shutdown': {
+      console.log(`[SYSTEM] Ended: ${event.properties?.reason || 'unknown'}`);
+      // 🧠 BRAIN — Log final brain snapshot & run dream cycle
+      try { const snapshot = brain.getSnapshot(); insertBrainSnapshot.run(conversationId, JSON.stringify(snapshot)); console.log('[BRAIN] Final snapshot saved'); } catch(e) {}
+      brain.dream(conversationId).catch(e => { console.error('[DREAM ERROR]', e.message); });
+      res.json({ acknowledged: true }); return;
+    }
+
     case 'application.transcription_ready': { console.log('[TRANSCRIPT] Ready'); res.json({ acknowledged: true }); return; }
     case 'application.recording_ready': { console.log(`[RECORDING] ${event.properties?.s3_key}`); res.json({ acknowledged: true }); return; }
     case 'application.perception_analysis': {
@@ -416,6 +456,12 @@ app.post('/webhooks/tavus', async (req, res) => {
 app.post('/api/identify-face', async (req, res) => {
   if (!FACE_SERVICE_URL) return res.json({ error: 'Face service not configured' });
   const result = await identifyFace(req.body.frame, req.body.conversation_id);
+  // 🧠 BRAIN — process face identification
+  if (result?.faces) {
+    for (const face of result.faces) {
+      if (face.name !== 'unknown') { brain.processFaceIdentification(face.name, face.confidence, req.body.conversation_id).catch(() => {}); }
+    }
+  }
   res.json(result || { faces: [], count: 0 });
 });
 
@@ -423,11 +469,7 @@ app.post('/api/identify-face', async (req, res) => {
 app.post('/api/register-face', async (req, res) => {
   if (!FACE_SERVICE_URL) return res.json({ error: 'Face service not configured' });
   try {
-    const r = await fetch(`${FACE_SERVICE_URL}/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: req.body.name, frame: req.body.frame }),
-    });
+    const r = await fetch(`${FACE_SERVICE_URL}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: req.body.name, frame: req.body.frame }) });
     const data = await r.json();
     console.log(`[FACE REG] ${data.name} — ${data.action}`);
     res.json(data);
@@ -437,39 +479,32 @@ app.post('/api/register-face', async (req, res) => {
 // KNOWN FACES list
 app.get('/api/faces', async (req, res) => {
   if (!FACE_SERVICE_URL) return res.json({ faces: [] });
-  try {
-    const r = await fetch(`${FACE_SERVICE_URL}/faces`);
-    res.json(await r.json());
-  } catch (e) { res.json({ faces: [] }); }
+  try { const r = await fetch(`${FACE_SERVICE_URL}/faces`); res.json(await r.json()); } catch (e) { res.json({ faces: [] }); }
 });
 
 // CREATE CONVERSATION (proxy to avoid CORS issues in browser)
 app.post('/api/create-conversation', async (req, res) => {
   try {
+    // 🧠 BRAIN — Reset for new conversation
+    brain.resetForNewConversation();
+    const baseContext = req.body.conversational_context || '';
+    const consciousnessContext = brain.getConsciousnessContext();
+    const fullContext = baseContext + consciousnessContext;
+
     const tavusRes = await fetch('https://tavusapi.com/v2/conversations', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.TAVUS_API_KEY
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.TAVUS_API_KEY },
       body: JSON.stringify({
         persona_id: req.body.persona_id || 'pef833bbe975',
         callback_url: `https://axiom-backend-production-dfba.up.railway.app/webhooks/tavus`,
-        conversational_context: req.body.conversational_context || '',
-        properties: {
-          max_call_duration: 3600,
-          enable_recording: true,
-          enable_transcription: true
-        }
+        conversational_context: fullContext,
+        properties: { max_call_duration: 3600, enable_recording: true, enable_transcription: true }
       })
     });
     const data = await tavusRes.json();
     console.log(`[CONVERSATION CREATED] ${data.conversation_id} | ${data.conversation_url}`);
     res.json(data);
-  } catch (e) {
-    console.error('[CREATE ERROR]', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { console.error('[CREATE ERROR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // API ENDPOINTS
@@ -482,7 +517,9 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   const p = db.prepare("SELECT tool_name, data, created_at FROM perception_log WHERE conversation_id = ? AND tool_name IN ('emotional_state','voice_emotion','energy_shift') ORDER BY created_at ASC").all(req.params.id);
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
-app.get('/health', (req, res) => { res.json({ status: 'alive', service: 'AXIOM Backend', uptime: process.uptime() }); });
+app.get('/health', (req, res) => {
+  res.json({ status: 'alive', service: 'AXIOM Backend + Brain v1', uptime: process.uptime(), brain: { regions: Object.keys(brain.regions).length, consciousness: brain.consciousness.toSnapshot() } });
+});
 
 // REINFORCEMENT LEARNING ENDPOINTS
 app.get('/api/reaction-pairs', (req, res) => {
@@ -490,110 +527,77 @@ app.get('/api/reaction-pairs', (req, res) => {
   res.json({ count: pairs.length, pairs });
 });
 
-// Communication profile — aggregated patterns from all sessions
 app.get('/api/communication-profile', (req, res) => {
-  // What makes Andrew engage (positive reactions)
-  const positive = db.prepare(
-    `SELECT axiom_said, user_reaction, reaction_valence, reaction_detail 
-     FROM reaction_pairs WHERE reaction_valence > 0.3 
-     ORDER BY reaction_valence DESC LIMIT 20`
-  ).all();
-
-  // What causes disengagement (negative reactions)
-  const negative = db.prepare(
-    `SELECT axiom_said, user_reaction, reaction_valence, reaction_detail 
-     FROM reaction_pairs WHERE reaction_valence < -0.3 
-     ORDER BY reaction_valence ASC LIMIT 20`
-  ).all();
-
-  // Most common emotional responses
-  const emotionCounts = db.prepare(
-    `SELECT user_reaction, COUNT(*) as count, AVG(reaction_valence) as avg_valence 
-     FROM reaction_pairs 
-     GROUP BY user_reaction 
-     ORDER BY count DESC LIMIT 15`
-  ).all();
-
-  // Generate natural language profile
+  const positive = db.prepare(`SELECT axiom_said, user_reaction, reaction_valence, reaction_detail FROM reaction_pairs WHERE reaction_valence > 0.3 ORDER BY reaction_valence DESC LIMIT 20`).all();
+  const negative = db.prepare(`SELECT axiom_said, user_reaction, reaction_valence, reaction_detail FROM reaction_pairs WHERE reaction_valence < -0.3 ORDER BY reaction_valence ASC LIMIT 20`).all();
+  const emotionCounts = db.prepare(`SELECT user_reaction, COUNT(*) as count, AVG(reaction_valence) as avg_valence FROM reaction_pairs GROUP BY user_reaction ORDER BY count DESC LIMIT 15`).all();
   const profileLines = [];
-  
-  if (positive.length > 0) {
-    const posReactions = [...new Set(positive.map(p => p.user_reaction))].slice(0, 5);
-    profileLines.push(`Andrew responds positively (${posReactions.join(', ')}) when you engage with depth and directness.`);
-  }
-  if (negative.length > 0) {
-    const negReactions = [...new Set(negative.map(n => n.user_reaction))].slice(0, 5);
-    profileLines.push(`He tends to disengage (${negReactions.join(', ')}) during certain patterns — adjust accordingly.`);
-  }
-
-  const confusionPairs = negative.filter(n => n.user_reaction.includes('confused') || n.user_reaction.includes('lost'));
-  if (confusionPairs.length > 0) {
-    profileLines.push('When explaining complex ideas, simplify — he has shown confusion with overly technical delivery.');
-  }
-
-  const engagementRises = positive.filter(p => p.user_reaction.includes('engagement_increasing'));
-  if (engagementRises.length > 0) {
-    profileLines.push('His engagement rises when the conversation gets personal, specific, or challenges his thinking.');
-  }
-
-  res.json({
-    profile_summary: profileLines.join(' '),
-    total_reaction_pairs: db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c,
-    positive_patterns: positive.slice(0, 10),
-    negative_patterns: negative.slice(0, 10),
-    emotion_distribution: emotionCounts
-  });
+  if (positive.length > 0) { profileLines.push(`Andrew responds positively (${[...new Set(positive.map(p => p.user_reaction))].slice(0, 5).join(', ')}) when you engage with depth and directness.`); }
+  if (negative.length > 0) { profileLines.push(`He tends to disengage (${[...new Set(negative.map(n => n.user_reaction))].slice(0, 5).join(', ')}) during certain patterns — adjust accordingly.`); }
+  if (negative.filter(n => n.user_reaction.includes('confused') || n.user_reaction.includes('lost')).length > 0) { profileLines.push('When explaining complex ideas, simplify — he has shown confusion with overly technical delivery.'); }
+  if (positive.filter(p => p.user_reaction.includes('engagement_increasing')).length > 0) { profileLines.push('His engagement rises when the conversation gets personal, specific, or challenges his thinking.'); }
+  res.json({ profile_summary: profileLines.join(' '), total_reaction_pairs: db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c, positive_patterns: positive.slice(0, 10), negative_patterns: negative.slice(0, 10), emotion_distribution: emotionCounts });
 });
 
-// Inject-ready context string for the LLM
 app.get('/api/adaptive-context', (req, res) => {
   const totalPairs = db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c;
-  
-  if (totalPairs < 5) {
-    res.json({ context: '', message: 'Not enough data yet. Need at least 5 reaction pairs.' });
-    return;
-  }
-
-  const positive = db.prepare(
-    `SELECT user_reaction, COUNT(*) as c FROM reaction_pairs 
-     WHERE reaction_valence > 0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`
-  ).all();
-
-  const negative = db.prepare(
-    `SELECT user_reaction, COUNT(*) as c FROM reaction_pairs 
-     WHERE reaction_valence < -0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`
-  ).all();
-
+  if (totalPairs < 5) { res.json({ context: '', message: 'Not enough data yet.' }); return; }
+  const positive = db.prepare(`SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence > 0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`).all();
+  const negative = db.prepare(`SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence < -0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 5`).all();
   let context = '\n\nADAPTIVE CONTEXT (learned from observing this person across conversations):\n';
-  
-  if (positive.length > 0) {
-    context += `What works: ${positive.map(p => p.user_reaction).join(', ')}. `;
-  }
-  if (negative.length > 0) {
-    context += `What to avoid: patterns that trigger ${negative.map(n => n.user_reaction).join(', ')}. `;
-  }
+  if (positive.length > 0) { context += `What works: ${positive.map(p => p.user_reaction).join(', ')}. `; }
+  if (negative.length > 0) { context += `What to avoid: patterns that trigger ${negative.map(n => n.user_reaction).join(', ')}. `; }
   context += `Based on ${totalPairs} observed reaction pairs across sessions.`;
-
   res.json({ context, total_pairs: totalPairs });
 });
-app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
-app.get('/', (req, res) => { res.json({ name: 'AXIOM Backend', version: '1.0.0', webhook: 'POST /webhooks/tavus' }); });
 
-// CATCH-ALL for any other POST — in case Tavus sends to a different path
+app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
+app.get('/', (req, res) => { res.json({ name: 'AXIOM Backend + Brain v1', version: '2.0.0', webhook: 'POST /webhooks/tavus', brain: 'GET /api/brain/*' }); });
+
+// ═══════════════════════════════════════════════════════════════
+// 🧠 BRAIN API ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/brain/snapshot', (req, res) => { res.json(brain.getSnapshot()); });
+
+app.get('/api/brain/consciousness', (req, res) => {
+  res.json({ contextString: brain.getConsciousnessContext(), snapshot: brain.consciousness.toSnapshot(), emotionalField: brain.consciousness.emotionalField, attention: brain.consciousness.attention, selfState: brain.consciousness.selfState, mirrorState: brain.consciousness.mirrorState, deepThinking: { pendingInsights: brain.consciousness.deepThinking.pendingInsights, isProcessing: brain.regions.prefrontal.isProcessing } });
+});
+
+app.get('/api/brain/regions', (req, res) => {
+  const regions = Object.entries(brain.regions).map(([name, region]) => ({ name, tier: region.tier, processCount: region.processCount, lastProcessed: region.lastProcessed }));
+  res.json({ regions });
+});
+
+app.post('/api/brain/dream', async (req, res) => {
+  const conversationId = req.body.conversation_id;
+  if (!conversationId) return res.json({ error: 'conversation_id required' });
+  try { const result = await brain.dream(conversationId); res.json({ success: true, result }); } catch (e) { res.json({ error: e.message }); }
+});
+
+app.post('/api/brain/reset', (req, res) => { brain.resetForNewConversation(); res.json({ success: true, message: 'Brain reset for new conversation' }); });
+app.post('/api/brain/insight-delivered', (req, res) => { brain.markInsightDelivered(); res.json({ success: true }); });
+app.get('/api/brain/snapshots', (req, res) => { res.json({ snapshots: db.prepare('SELECT * FROM brain_snapshots ORDER BY created_at DESC LIMIT 20').all() }); });
+
+// CATCH-ALL for any other POST
 app.post('*', (req, res) => {
   console.log(`\n[CATCH-ALL] POST to ${req.path}`);
   console.log(JSON.stringify(req.body).slice(0, 1000));
   try { insertRawEvent.run(req.path, JSON.stringify(req.body)); } catch(e) {}
   res.json({ acknowledged: true });
 });
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════╗`);
-  console.log(`║     AXIOM BACKEND v1.0.0             ║`);
-  console.log(`║     Level 5 Being Infrastructure     ║`);
+  console.log(`║     AXIOM BACKEND v2.0.0             ║`);
+  console.log(`║     Level 5 Being + Brain v1         ║`);
   console.log(`╠══════════════════════════════════════╣`);
   console.log(`║  Webhook: /webhooks/tavus             ║`);
+  console.log(`║  Brain:   /api/brain/*                ║`);
   console.log(`║  Health:  /health                     ║`);
   console.log(`║  Port:    ${PORT}                          ║`);
+  console.log(`║  Regions: ${Object.keys(brain.regions).length} active                  ║`);
+  console.log(`║  LLM:     ${LLM_PROXY_URL ? '✅' : '❌'} Proxy                    ║`);
   console.log(`╚══════════════════════════════════════╝\n`);
 });
