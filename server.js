@@ -2,7 +2,6 @@ import express from 'express';
 import Database from 'better-sqlite3';
 import dotenv from 'dotenv';
 import { existsSync, mkdirSync } from 'fs';
-import AXIOMBrain from './brain.js';  // 🧠 BRAIN INTEGRATION
 
 dotenv.config();
 
@@ -159,7 +158,7 @@ console.log('Database initialized.');
 
 // 🧠 BRAIN INTEGRATION — Initialize cognitive architecture
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
-const brain = new AXIOMBrain(db, { llmProxy: LLM_PROXY_URL });
+// Brain processing moved to Cognitive Core
 
 // EMOTION VALENCE SCORING — maps emotions to positive/negative values
 function getEmotionValence(emotion) {
@@ -220,7 +219,6 @@ const toolHandlers = {
     
     // 🧠 Feed recall results to hippocampus
     try {
-      brain.processPerception('recall_memory', args, cid);
     } catch(e) {}
     
     // Inject adaptive context if enough data exists
@@ -238,9 +236,8 @@ const toolHandlers = {
     }
 
     // 🧠 Inject consciousness state alongside memories
-    const consciousnessContext = brain.getConsciousnessContext();
     
-    return { found: true, count: memories.length, memories: formatted + adaptiveNote + consciousnessContext };
+    return { found: true, count: memories.length, memories: formatted + adaptiveNote };
   },
 
   search_web: async (args) => {
@@ -300,7 +297,7 @@ const toolHandlers = {
     insertInternalState.run(cid, args.state, args.dominant_quality, args.trigger);
     console.log(`[INTERNAL STATE] ${args.dominant_quality}: ${args.state}`);
     // 🧠 Feed to Insula (self-awareness)
-    try { brain.processPerception('log_internal_state', args, cid); } catch(e) {}
+    try { } catch(e) {}
     return { logged: true, message: 'Internal state recorded.' };
   },
 
@@ -315,7 +312,7 @@ const toolHandlers = {
   }
 };
 
-// RAVEN PERCEPTION HANDLERS — each one also feeds the brain
+// RAVEN PERCEPTION HANDLERS
 const perceptionHandlers = {
   detect_emotional_state: (a, cid) => {
     insertPerception.run(cid, 'emotional_state', JSON.stringify(a));
@@ -325,7 +322,6 @@ const perceptionHandlers = {
       const valence = getEmotionValence(a.primary_emotion);
       try { insertReactionPair.run(cid, recent.text, a.primary_emotion, valence, a.description || ''); } catch(e) {}
     }
-    brain.processPerception('detect_emotional_state', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
@@ -337,7 +333,6 @@ const perceptionHandlers = {
       const valence = a.trend === 'increasing' ? 0.6 : -0.6;
       try { insertReactionPair.run(cid, recent.text, `engagement_${a.trend}`, valence, `${a.engagement}, gaze: ${a.gaze_direction || 'unknown'}`); } catch(e) {}
     }
-    brain.processPerception('detect_engagement_level', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
@@ -349,7 +344,6 @@ const perceptionHandlers = {
       const valence = getReactionValence(a.reaction_type);
       try { insertReactionPair.run(cid, recent.text, a.reaction_type, valence, `${a.physical_cue}: ${a.likely_meaning}`); } catch(e) {}
     }
-    brain.processPerception('detect_unspoken_reaction', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
@@ -361,35 +355,30 @@ const perceptionHandlers = {
       const valence = a.state === 'clear_understanding' ? 0.7 : a.state === 'aha_moment' ? 1.0 : a.state === 'confused' ? -0.7 : a.state === 'lost' ? -1.0 : 0;
       if (valence !== 0) { try { insertReactionPair.run(cid, recent.text, `comprehension_${a.state}`, valence, a.visual_cue || ''); } catch(e) {} }
     }
-    brain.processPerception('detect_comprehension_state', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
   detect_voice_emotion: (a, cid) => {
     insertPerception.run(cid, 'voice_emotion', JSON.stringify(a));
     console.log(`[RAVEN/AUDIO] Voice: ${a.emotion}${a.words_voice_mismatch ? ' [MISMATCH]' : ''}`);
-    brain.processPerception('detect_voice_emotion', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
   detect_energy_shift: (a, cid) => {
     insertPerception.run(cid, 'energy_shift', JSON.stringify(a));
     console.log(`[RAVEN/AUDIO] Energy: ${a.direction} (${a.intensity})`);
-    brain.processPerception('detect_energy_shift', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
   detect_conversational_intent: (a, cid) => {
     insertPerception.run(cid, 'intent', JSON.stringify(a));
     console.log(`[RAVEN/AUDIO] Intent: ${a.intent} (${a.confidence})`);
-    brain.processPerception('detect_conversational_intent', a, cid).catch(() => {});
     return { acknowledged: true };
   },
 
   detect_presence_level: (a, cid) => {
     insertPerception.run(cid, 'presence', JSON.stringify(a));
     console.log(`[RAVEN/AUDIO] Presence: ${a.presence} — ${a.recommendation}`);
-    brain.processPerception('detect_presence_level', a, cid).catch(() => {});
     return { acknowledged: true };
   }
 };
@@ -426,7 +415,6 @@ app.post('/webhooks/tavus', async (req, res) => {
           recentAxiomUtterances.set(conversationId, { text: content, timestamp: Date.now() });
         }
         // 🧠 BRAIN — process utterance through cognitive pipeline
-        try { await brain.processUtterance(role, content, conversationId); } catch (e) { console.error('[BRAIN UTTERANCE ERROR]', e.message); }
       }
       res.json({ acknowledged: true }); return;
     }
@@ -435,9 +423,11 @@ app.post('/webhooks/tavus', async (req, res) => {
 
     case 'system.shutdown': {
       console.log(`[SYSTEM] Ended: ${event.properties?.reason || 'unknown'}`);
-      // 🧠 BRAIN — Log final brain snapshot & run dream cycle
-      try { const snapshot = brain.getSnapshot(); insertBrainSnapshot.run(conversationId, JSON.stringify(snapshot)); console.log('[BRAIN] Final snapshot saved'); } catch(e) {}
-      brain.dream(conversationId).catch(e => { console.error('[DREAM ERROR]', e.message); });
+      // Trigger dream engine in Cognitive Core
+      fetch('https://axiom-cognitive-core-production.up.railway.app/dream', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId }),
+      }).catch(e => console.error('[DREAM TRIGGER]', e.message));
       res.json({ acknowledged: true }); return;
     }
 
@@ -459,7 +449,7 @@ app.post('/api/identify-face', async (req, res) => {
   // 🧠 BRAIN — process face identification
   if (result?.faces) {
     for (const face of result.faces) {
-      if (face.name !== 'unknown') { brain.processFaceIdentification(face.name, face.confidence, req.body.conversation_id).catch(() => {}); }
+      if (face.name !== 'unknown') { }
     }
   }
   res.json(result || { faces: [], count: 0 });
@@ -486,10 +476,8 @@ app.get('/api/faces', async (req, res) => {
 app.post('/api/create-conversation', async (req, res) => {
   try {
     // 🧠 BRAIN — Reset for new conversation
-    brain.resetForNewConversation();
     const baseContext = req.body.conversational_context || '';
-    const consciousnessContext = brain.getConsciousnessContext();
-    const fullContext = baseContext + consciousnessContext;
+    const baseContext = baseContext;
 
     const tavusRes = await fetch('https://tavusapi.com/v2/conversations', {
       method: 'POST',
@@ -497,7 +485,7 @@ app.post('/api/create-conversation', async (req, res) => {
       body: JSON.stringify({
         persona_id: req.body.persona_id || 'pef833bbe975',
         callback_url: `https://axiom-backend-production-dfba.up.railway.app/webhooks/tavus`,
-        conversational_context: fullContext,
+        conversational_context: baseContext,
         properties: { max_call_duration: 3600, enable_recording: true, enable_transcription: true }
       })
     });
@@ -518,7 +506,6 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
 app.get('/health', (req, res) => {
-  res.json({ status: 'alive', service: 'AXIOM Backend + Brain v1', uptime: process.uptime(), brain: { regions: Object.keys(brain.regions).length, consciousness: brain.consciousness.toSnapshot() } });
 });
 
 // REINFORCEMENT LEARNING ENDPOINTS
@@ -552,32 +539,22 @@ app.get('/api/adaptive-context', (req, res) => {
 });
 
 app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
-app.get('/', (req, res) => { res.json({ name: 'AXIOM Backend + Brain v1', version: '2.0.0', webhook: 'POST /webhooks/tavus', brain: 'GET /api/brain/*' }); });
 
 // ═══════════════════════════════════════════════════════════════
 // 🧠 BRAIN API ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
 
-app.get('/api/brain/snapshot', (req, res) => { res.json(brain.getSnapshot()); });
 
-app.get('/api/brain/consciousness', (req, res) => {
-  res.json({ contextString: brain.getConsciousnessContext(), snapshot: brain.consciousness.toSnapshot(), emotionalField: brain.consciousness.emotionalField, attention: brain.consciousness.attention, selfState: brain.consciousness.selfState, mirrorState: brain.consciousness.mirrorState, deepThinking: { pendingInsights: brain.consciousness.deepThinking.pendingInsights, isProcessing: brain.regions.prefrontal.isProcessing } });
 });
 
-app.get('/api/brain/regions', (req, res) => {
-  const regions = Object.entries(brain.regions).map(([name, region]) => ({ name, tier: region.tier, processCount: region.processCount, lastProcessed: region.lastProcessed }));
   res.json({ regions });
 });
 
-app.post('/api/brain/dream', async (req, res) => {
   const conversationId = req.body.conversation_id;
   if (!conversationId) return res.json({ error: 'conversation_id required' });
-  try { const result = await brain.dream(conversationId); res.json({ success: true, result }); } catch (e) { res.json({ error: e.message }); }
+  res.json({ message: 'Dream engine moved to Cognitive Core. POST to https://axiom-cognitive-core-production.up.railway.app/dream instead.' });
 });
 
-app.post('/api/brain/reset', (req, res) => { brain.resetForNewConversation(); res.json({ success: true, message: 'Brain reset for new conversation' }); });
-app.post('/api/brain/insight-delivered', (req, res) => { brain.markInsightDelivered(); res.json({ success: true }); });
-app.get('/api/brain/snapshots', (req, res) => { res.json({ snapshots: db.prepare('SELECT * FROM brain_snapshots ORDER BY created_at DESC LIMIT 20').all() }); });
 
 // CATCH-ALL for any other POST
 app.post('*', (req, res) => {
@@ -594,10 +571,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`║     Level 5 Being + Brain v1         ║`);
   console.log(`╠══════════════════════════════════════╣`);
   console.log(`║  Webhook: /webhooks/tavus             ║`);
-  console.log(`║  Brain:   /api/brain/*                ║`);
+  console.log(`║  Brain:   Cognitive Core (external)   ║`);
   console.log(`║  Health:  /health                     ║`);
   console.log(`║  Port:    ${PORT}                          ║`);
-  console.log(`║  Regions: ${Object.keys(brain.regions).length} active                  ║`);
   console.log(`║  LLM:     ${LLM_PROXY_URL ? '✅' : '❌'} Proxy                    ║`);
   console.log(`╚══════════════════════════════════════╝\n`);
 });
