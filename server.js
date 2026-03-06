@@ -475,8 +475,8 @@ app.get('/api/faces', async (req, res) => {
 // CREATE CONVERSATION (proxy to avoid CORS issues in browser)
 app.post('/api/create-conversation', async (req, res) => {
   try {
-    // 🧠 BRAIN — Reset for new conversation
-    const baseContext = req.body.conversational_context || '';
+    // Build conversational context from frontend
+    const convContext = req.body.conversational_context || '';
 
     const tavusRes = await fetch('https://tavusapi.com/v2/conversations', {
       method: 'POST',
@@ -484,7 +484,7 @@ app.post('/api/create-conversation', async (req, res) => {
       body: JSON.stringify({
         persona_id: req.body.persona_id || 'pef833bbe975',
         callback_url: `https://axiom-backend-production-dfba.up.railway.app/webhooks/tavus`,
-        conversational_context: baseContext,
+        conversational_context: convContext,
         properties: { max_call_duration: 3600, enable_recording: true, enable_transcription: true }
       })
     });
