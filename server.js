@@ -477,7 +477,6 @@ app.post('/api/create-conversation', async (req, res) => {
   try {
     // 🧠 BRAIN — Reset for new conversation
     const baseContext = req.body.conversational_context || '';
-    const baseContext = baseContext;
 
     const tavusRes = await fetch('https://tavusapi.com/v2/conversations', {
       method: 'POST',
@@ -540,20 +539,8 @@ app.get('/api/adaptive-context', (req, res) => {
 
 app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT * FROM raw_events ORDER BY created_at DESC LIMIT 50').all() }); });
 
-// ═══════════════════════════════════════════════════════════════
-// 🧠 BRAIN API ENDPOINTS
-// ═══════════════════════════════════════════════════════════════
+// Brain processing moved to Cognitive Core (axiom-cognitive-core)
 
-
-});
-
-  res.json({ regions });
-});
-
-  const conversationId = req.body.conversation_id;
-  if (!conversationId) return res.json({ error: 'conversation_id required' });
-  res.json({ message: 'Dream engine moved to Cognitive Core. POST to https://axiom-cognitive-core-production.up.railway.app/dream instead.' });
-});
 
 
 // CATCH-ALL for any other POST
