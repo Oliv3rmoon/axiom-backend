@@ -564,3 +564,4 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`║  LLM:     ${LLM_PROXY_URL ? '✅' : '❌'} Proxy                    ║`);
   console.log(`╚══════════════════════════════════════╝\n`);
 });
+// Force rebuild Fri Mar  6 15:49:04 PST 2026
