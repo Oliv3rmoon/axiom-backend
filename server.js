@@ -805,6 +805,45 @@ app.get('/api/memories/stats', (req, res) => {
   res.json({ session, tiers });
 });
 
+// Bootstrap: set session counter based on existing data + promote core memories
+app.post('/api/memories/bootstrap', (req, res) => {
+  const currentSession = getSessionNumber();
+  
+  // If session is 0 but we have memories, bootstrap to a reasonable value
+  let newSession = currentSession;
+  if (currentSession === 0) {
+    const memCount = db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew'").get().c;
+    if (memCount > 0) {
+      // Estimate: ~5 memories per session on average
+      newSession = Math.max(5, Math.ceil(memCount / 5));
+      db.prepare('UPDATE session_counter SET count = ? WHERE id = 1').run(newSession);
+      console.log(`[BOOTSTRAP] Session counter set to ${newSession} (based on ${memCount} memories)`);
+    }
+  }
+
+  // Promote all importance >= 9 to core
+  const promoted = db.prepare(
+    "UPDATE memories SET tier = 'core' WHERE user_id = 'andrew' AND tier = 'episodic' AND importance >= 9"
+  ).run();
+
+  // Set session_number on old memories that have 0
+  if (newSession > 0) {
+    db.prepare(
+      "UPDATE memories SET session_number = 1 WHERE user_id = 'andrew' AND session_number = 0"
+    ).run();
+  }
+
+  const tiers = {
+    core: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'core'").get().c,
+    long_term: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'long_term'").get().c,
+    episodic: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'episodic'").get().c,
+    archived: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'archived'").get().c,
+  };
+
+  console.log(`[BOOTSTRAP] Session: ${newSession} | Promoted: ${promoted.changes} | Tiers: ${JSON.stringify(tiers)}`);
+  res.json({ session: newSession, promoted_to_core: promoted.changes, tiers });
+});
+
 // ============================================================
 // MEMORY CONSOLIDATION — Dream-triggered compression
 // ============================================================
@@ -824,7 +863,12 @@ app.post('/api/memories/consolidate', async (req, res) => {
 
   if (candidates.length < 3) {
     console.log(`[CONSOLIDATION] Only ${candidates.length} candidates — skipping (need >= 3)`);
-    return res.json({ consolidated: 0, reason: 'Not enough old memories to consolidate' });
+    // Still promote high-importance to core even if nothing to consolidate
+    const promoted = db.prepare(
+      "UPDATE memories SET tier = 'core' WHERE user_id = 'andrew' AND tier = 'episodic' AND importance >= 9"
+    ).run();
+    if (promoted.changes > 0) console.log(`[CONSOLIDATION] Promoted ${promoted.changes} memories to CORE tier`);
+    return res.json({ consolidated: 0, reason: 'Not enough old memories to consolidate', promoted_to_core: promoted.changes });
   }
 
   // Group by category
