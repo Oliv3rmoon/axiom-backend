@@ -6,6 +6,8 @@ import { existsSync, mkdirSync } from 'fs';
 dotenv.config();
 
 const FACE_SERVICE_URL = process.env.FACE_SERVICE_URL || '';
+const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
+const COGNITIVE_CORE_URL = process.env.COGNITIVE_CORE_URL || '';
 
 // Face identification helper
 async function identifyFace(frameData, conversationId) {
@@ -449,7 +451,12 @@ app.post('/api/identify-face', async (req, res) => {
   // 🧠 BRAIN — process face identification
   if (result?.faces) {
     for (const face of result.faces) {
-      if (face.name !== 'unknown') { }
+      if (face.name !== 'unknown' && COGNITIVE_CORE_URL) {
+        fetch(`${COGNITIVE_CORE_URL}/face-id`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: face.name, confidence: face.confidence, conversation_id: req.body.conversation_id }),
+        }).catch(() => {});
+      }
     }
   }
   res.json(result || { faces: [], count: 0 });
@@ -470,6 +477,58 @@ app.post('/api/register-face', async (req, res) => {
 app.get('/api/faces', async (req, res) => {
   if (!FACE_SERVICE_URL) return res.json({ faces: [] });
   try { const r = await fetch(`${FACE_SERVICE_URL}/faces`); res.json(await r.json()); } catch (e) { res.json({ faces: [] }); }
+});
+
+// ============================================================
+// VOICE IDENTIFICATION — proxy to Python voice service
+// ============================================================
+app.post('/api/identify-voice', async (req, res) => {
+  if (!VOICE_SERVICE_URL) return res.json({ speaker: 'unknown', error: 'Voice service not configured' });
+  try {
+    const r = await fetch(`${VOICE_SERVICE_URL}/identify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: req.body.audio, conversation_id: req.body.conversation_id, threshold: req.body.threshold || 0.75 }),
+    });
+    const data = await r.json();
+    console.log(`[VOICE ID] ${data.speaker} (${data.confidence})`);
+    // Forward to Cognitive Core temporal lobe
+    if (COGNITIVE_CORE_URL && data.speaker !== 'unknown') {
+      fetch(`${COGNITIVE_CORE_URL}/voice-id`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker: data.speaker, confidence: data.confidence, conversation_id: req.body.conversation_id }),
+      }).catch(() => {});
+    }
+    res.json(data);
+  } catch (e) { res.json({ speaker: 'unknown', error: e.message }); }
+});
+
+app.post('/api/enroll-voice', async (req, res) => {
+  if (!VOICE_SERVICE_URL) return res.json({ error: 'Voice service not configured' });
+  try {
+    const r = await fetch(`${VOICE_SERVICE_URL}/enroll`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: req.body.name, audio: req.body.audio }),
+    });
+    const data = await r.json();
+    console.log(`[VOICE ENROLL] ${data.name} — ${data.action}`);
+    res.json(data);
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+app.post('/api/verify-voice', async (req, res) => {
+  if (!VOICE_SERVICE_URL) return res.json({ verified: false, error: 'Voice service not configured' });
+  try {
+    const r = await fetch(`${VOICE_SERVICE_URL}/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: req.body.name, audio: req.body.audio }),
+    });
+    res.json(await r.json());
+  } catch (e) { res.json({ verified: false, error: e.message }); }
+});
+
+app.get('/api/voices', async (req, res) => {
+  if (!VOICE_SERVICE_URL) return res.json({ voices: [] });
+  try { const r = await fetch(`${VOICE_SERVICE_URL}/voices`); res.json(await r.json()); } catch (e) { res.json({ voices: [] }); }
 });
 
 // CREATE CONVERSATION (proxy to avoid CORS issues in browser)
