@@ -555,6 +555,180 @@ app.post('/api/create-conversation', async (req, res) => {
 
 // API ENDPOINTS
 app.get('/api/memories', (req, res) => { res.json({ memories: getAllMemories.all('andrew') }); });
+
+// ============================================================
+// SMART MEMORY RETRIEVAL — TF-IDF Vector Search
+// ============================================================
+// Instead of dumping ALL memories into the prompt, retrieve only
+// the most relevant ones for the current conversation turn.
+//
+// Architecture:
+//   Core memories (importance >= 9) → ALWAYS loaded (identity-level)
+//   Relevant memories (top K by cosine similarity) → retrieved per turn
+//   Result: ~10 memories per turn instead of ALL of them
+// ============================================================
+
+// Stop words to filter from embeddings
+const STOP_WORDS = new Set([
+  'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'you', 'your', 'he', 'him', 'his',
+  'she', 'her', 'they', 'them', 'their', 'it', 'its', 'what', 'which', 'who', 'whom',
+  'this', 'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+  'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an',
+  'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at',
+  'by', 'for', 'with', 'about', 'against', 'between', 'through', 'during', 'before',
+  'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off',
+  'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
+  'where', 'why', 'how', 'all', 'both', 'each', 'few', 'more', 'most', 'other',
+  'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too',
+  'very', 'can', 'will', 'just', 'don', 'should', 'now', 'also', 'would', 'could',
+  'into', 'its', 'let', 'may', 'might', 'shall', 'since', 'still', 'yet',
+]);
+
+function tokenize(text) {
+  return text.toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+}
+
+// Build TF vector for a text
+function termFrequency(tokens) {
+  const tf = {};
+  for (const t of tokens) {
+    tf[t] = (tf[t] || 0) + 1;
+  }
+  // Normalize by max frequency
+  const maxFreq = Math.max(...Object.values(tf), 1);
+  for (const t in tf) tf[t] /= maxFreq;
+  return tf;
+}
+
+// Compute IDF across all memories
+function computeIDF() {
+  const allMemories = db.prepare('SELECT memory FROM memories WHERE user_id = ?').all('andrew');
+  const N = allMemories.length || 1;
+  const docFreq = {};
+
+  for (const row of allMemories) {
+    const uniqueTokens = new Set(tokenize(row.memory));
+    for (const t of uniqueTokens) {
+      docFreq[t] = (docFreq[t] || 0) + 1;
+    }
+  }
+
+  const idf = {};
+  for (const t in docFreq) {
+    idf[t] = Math.log(N / (docFreq[t] + 1)) + 1; // smoothed IDF
+  }
+  return idf;
+}
+
+// Generate TF-IDF embedding for a text given IDF weights
+function embed(text, idf) {
+  const tokens = tokenize(text);
+  const tf = termFrequency(tokens);
+  const vec = {};
+  for (const t in tf) {
+    vec[t] = tf[t] * (idf[t] || 1); // use IDF weight, default 1 for unseen terms
+  }
+  return vec;
+}
+
+// Cosine similarity between two sparse vectors
+function cosineSim(a, b) {
+  let dot = 0, normA = 0, normB = 0;
+  for (const k in a) {
+    normA += a[k] * a[k];
+    if (b[k]) dot += a[k] * b[k];
+  }
+  for (const k in b) normB += b[k] * b[k];
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+// Main retrieval function
+function retrieveRelevantMemories(query, maxCore = 5, maxRelevant = 5) {
+  const allMems = db.prepare(
+    'SELECT id, memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC'
+  ).all('andrew');
+
+  if (allMems.length === 0) return { core: [], relevant: [], total: 0 };
+
+  // Split into core (always loaded) and searchable
+  const core = allMems.filter(m => m.importance >= 9).slice(0, maxCore);
+  const searchable = allMems.filter(m => m.importance < 9);
+
+  // If query is empty or too short, just return core + most recent
+  if (!query || query.trim().length < 3) {
+    const recent = searchable.slice(0, maxRelevant);
+    return { core, relevant: recent, total: allMems.length };
+  }
+
+  // Compute IDF across all memories
+  const idf = computeIDF();
+
+  // Embed the query
+  const queryVec = embed(query, idf);
+
+  // Score each searchable memory
+  const scored = searchable.map(m => {
+    const memVec = embed(m.memory, idf);
+    const similarity = cosineSim(queryVec, memVec);
+    // Boost by recency (memories from last hour get +0.1)
+    const ageMs = Date.now() - new Date(m.created_at).getTime();
+    const recencyBoost = ageMs < 3600000 ? 0.1 : ageMs < 86400000 ? 0.05 : 0;
+    return { ...m, similarity: similarity + recencyBoost };
+  });
+
+  // Sort by similarity descending, take top K
+  scored.sort((a, b) => b.similarity - a.similarity);
+  const relevant = scored.slice(0, maxRelevant);
+
+  // Deduplicate (core and relevant might overlap if importance fluctuates)
+  const coreIds = new Set(core.map(m => m.id));
+  const deduped = relevant.filter(m => !coreIds.has(m.id));
+
+  return {
+    core,
+    relevant: deduped,
+    total: allMems.length,
+    query_tokens: tokenize(query).slice(0, 10),
+  };
+}
+
+// Smart retrieval endpoint — called by Cognitive Core each turn
+app.post('/api/memories/relevant', (req, res) => {
+  const { query, max_core, max_relevant } = req.body;
+  const result = retrieveRelevantMemories(
+    query || '',
+    max_core || 5,
+    max_relevant || 5
+  );
+  console.log(`[MEMORY RETRIEVAL] Query: "${(query || '').slice(0, 50)}" → ${result.core.length} core + ${result.relevant.length} relevant (of ${result.total} total)`);
+  res.json(result);
+});
+
+// Formatted retrieval — returns a ready-to-inject context string
+app.post('/api/memories/context', (req, res) => {
+  const { query, max_core, max_relevant } = req.body;
+  const result = retrieveRelevantMemories(query || '', max_core || 5, max_relevant || 5);
+
+  let context = '';
+  if (result.core.length > 0) {
+    context += 'CORE MEMORIES (always known):\n';
+    context += result.core.map(m => `[${m.category}, imp:${m.importance}] ${m.memory}`).join('\n');
+  }
+  if (result.relevant.length > 0) {
+    context += '\n\nRELEVANT MEMORIES (recalled for this moment):\n';
+    context += result.relevant.map(m => `[${m.category}, imp:${m.importance}] ${m.memory}`).join('\n');
+  }
+  if (result.total > result.core.length + result.relevant.length) {
+    context += `\n\n[${result.total - result.core.length - result.relevant.length} other memories stored — use recall_memory tool to search for specific ones]`;
+  }
+
+  console.log(`[MEMORY CONTEXT] ${context.length} chars (${result.core.length} core + ${result.relevant.length} relevant)`);
+  res.json({ context, core_count: result.core.length, relevant_count: result.relevant.length, total: result.total });
+});
 app.get('/api/internal-states', (req, res) => { res.json({ states: db.prepare('SELECT * FROM internal_states ORDER BY created_at DESC LIMIT 50').all() }); });
 app.get('/api/perceptions', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log ORDER BY created_at DESC LIMIT 100').all() }); });
 app.get('/api/perceptions/:id', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log WHERE conversation_id = ? ORDER BY created_at ASC').all(req.params.id) }); });
