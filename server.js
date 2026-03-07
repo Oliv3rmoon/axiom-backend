@@ -70,9 +70,29 @@ db.exec(`
     memory TEXT NOT NULL,
     category TEXT NOT NULL,
     importance INTEGER NOT NULL,
+    tier TEXT DEFAULT 'episodic',
+    consolidated_from TEXT DEFAULT NULL,
+    session_number INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+// Migrate: add tier column if missing (for existing DBs)
+try { db.exec("ALTER TABLE memories ADD COLUMN tier TEXT DEFAULT 'episodic'"); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN consolidated_from TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN session_number INTEGER DEFAULT 0"); } catch {}
+
+// Session counter — increments each time a conversation starts
+db.exec(`CREATE TABLE IF NOT EXISTS session_counter (id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)`);
+try { db.exec("INSERT OR IGNORE INTO session_counter (id, count) VALUES (1, 0)"); } catch {}
+
+function getSessionNumber() {
+  return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
+}
+function incrementSession() {
+  db.prepare('UPDATE session_counter SET count = count + 1 WHERE id = 1').run();
+  return getSessionNumber();
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS internal_states (
@@ -149,9 +169,9 @@ const insertReactionPair = db.prepare(
 // Track last thing AXIOM said for reaction correlation
 const recentAxiomUtterances = new Map(); // conversation_id -> {text, timestamp}
 
-const insertMemory = db.prepare(`INSERT INTO memories (user_id, conversation_id, memory, category, importance) VALUES (?, ?, ?, ?, ?)`);
-const searchMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? AND memory LIKE ? ORDER BY importance DESC, created_at DESC LIMIT 10`);
-const getAllMemories = db.prepare(`SELECT memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC LIMIT 20`);
+const insertMemory = db.prepare(`INSERT INTO memories (user_id, conversation_id, memory, category, importance, tier, session_number) VALUES (?, ?, ?, ?, ?, 'episodic', ?)`);
+const searchMemories = db.prepare(`SELECT id, memory, category, importance, tier, created_at FROM memories WHERE user_id = ? AND memory LIKE ? AND tier != 'archived' ORDER BY importance DESC, created_at DESC LIMIT 10`);
+const getAllMemories = db.prepare(`SELECT id, memory, category, importance, tier, session_number, created_at FROM memories WHERE user_id = ? AND tier != 'archived' ORDER BY importance DESC, created_at DESC LIMIT 50`);
 const insertInternalState = db.prepare(`INSERT INTO internal_states (conversation_id, state, dominant_quality, trigger_event) VALUES (?, ?, ?, ?)`);
 const insertPerception = db.prepare(`INSERT INTO perception_log (conversation_id, tool_name, data) VALUES (?, ?, ?)`);
 const insertTranscript = db.prepare(`INSERT INTO transcripts (conversation_id, role, content) VALUES (?, ?, ?)`);
@@ -197,8 +217,15 @@ const insertRawEvent = db.prepare(`INSERT INTO raw_events (path, body) VALUES (?
 const toolHandlers = {
   save_memory: (args, cid) => {
     const { memory, category, importance } = args;
-    insertMemory.run('andrew', cid, memory, category, importance);
-    console.log(`[MEMORY SAVED] (${category}, importance: ${importance}): ${memory}`);
+    const session = getSessionNumber();
+    insertMemory.run('andrew', cid, memory, category, importance, session);
+    console.log(`[MEMORY SAVED] (${category}, imp:${importance}, session:${session}): ${memory.slice(0, 80)}`);
+    // Auto-promote high importance to core tier
+    if (importance >= 9) {
+      const lastId = db.prepare('SELECT last_insert_rowid() as id').get().id;
+      db.prepare("UPDATE memories SET tier = 'core' WHERE id = ?").run(lastId);
+      console.log(`[MEMORY] Auto-promoted to CORE tier (imp >= 9)`);
+    }
     return { success: true, message: `Memory saved: "${memory}"` };
   },
 
@@ -216,7 +243,7 @@ const toolHandlers = {
         .sort((a, b) => b.importance - a.importance).slice(0, 10);
     }
     if (memories.length === 0) return { found: false, message: "No memories found. This may be your first conversation." };
-    const formatted = memories.map(m => `[${m.category}, importance: ${m.importance}] ${m.memory} (${m.created_at})`).join('\n');
+    const formatted = memories.map(m => `[${m.tier || 'episodic'}/${m.category}, imp:${m.importance}] ${m.memory} (${m.created_at})`).join('\n');
     console.log(`[MEMORY RECALL] Query: "${query}" — Found ${memories.length} memories`);
     
     // 🧠 Feed recall results to hippocampus
@@ -534,6 +561,10 @@ app.get('/api/voices', async (req, res) => {
 // CREATE CONVERSATION (proxy to avoid CORS issues in browser)
 app.post('/api/create-conversation', async (req, res) => {
   try {
+    // Increment session counter — new conversation = new session
+    const session = incrementSession();
+    console.log(`[SESSION] Starting session ${session}`);
+
     // Build conversational context from frontend
     const convContext = req.body.conversational_context || '';
 
@@ -557,18 +588,33 @@ app.post('/api/create-conversation', async (req, res) => {
 app.get('/api/memories', (req, res) => { res.json({ memories: getAllMemories.all('andrew') }); });
 
 // ============================================================
-// SMART MEMORY RETRIEVAL — TF-IDF Vector Search
+// MEMORY HIERARCHY — Tiered Retrieval + Consolidation
 // ============================================================
-// Instead of dumping ALL memories into the prompt, retrieve only
-// the most relevant ones for the current conversation turn.
+// 4 tiers, modeled after human memory:
 //
-// Architecture:
-//   Core memories (importance >= 9) → ALWAYS loaded (identity-level)
-//   Relevant memories (top K by cosine similarity) → retrieved per turn
-//   Result: ~10 memories per turn instead of ALL of them
+// CORE (always loaded):
+//   Permanent identity facts. "Andrew wants autonomous agency."
+//   importance >= 9 or manually promoted. NEVER consolidated.
+//
+// LONG_TERM (retrieved by relevance):
+//   Consolidated summaries. "We explored consciousness deeply across
+//   several sessions — Andrew connects it to his architecture work."
+//   Created by Dream Engine compressing old episodic memories.
+//
+// SHORT_TERM (retrieved by recency):
+//   Memories from the last 3 sessions. Still episodic detail.
+//   "Andrew fixed 4 bugs tonight and deployed mirror neurons."
+//
+// EPISODIC (searchable via recall_memory tool):
+//   Raw memories. Once older than 3 sessions, candidates for
+//   consolidation into long_term summaries by the Dream Engine.
+//
+// ARCHIVED:
+//   Source memories that have been consolidated. Not loaded,
+//   not searched. Kept for audit trail.
 // ============================================================
 
-// Stop words to filter from embeddings
+// Stop words for TF-IDF
 const STOP_WORDS = new Set([
   'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'you', 'your', 'he', 'him', 'his',
   'she', 'her', 'they', 'them', 'their', 'it', 'its', 'what', 'which', 'who', 'whom',
@@ -585,149 +631,303 @@ const STOP_WORDS = new Set([
 ]);
 
 function tokenize(text) {
-  return text.toLowerCase()
-    .replace(/[^a-z0-9\s'-]/g, ' ')
-    .split(/\s+/)
+  return text.toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/)
     .filter(w => w.length > 2 && !STOP_WORDS.has(w));
 }
 
-// Build TF vector for a text
 function termFrequency(tokens) {
   const tf = {};
-  for (const t of tokens) {
-    tf[t] = (tf[t] || 0) + 1;
-  }
-  // Normalize by max frequency
+  for (const t of tokens) tf[t] = (tf[t] || 0) + 1;
   const maxFreq = Math.max(...Object.values(tf), 1);
   for (const t in tf) tf[t] /= maxFreq;
   return tf;
 }
 
-// Compute IDF across all memories
 function computeIDF() {
-  const allMemories = db.prepare('SELECT memory FROM memories WHERE user_id = ?').all('andrew');
-  const N = allMemories.length || 1;
+  const allMems = db.prepare("SELECT memory FROM memories WHERE user_id = ? AND tier != 'archived'").all('andrew');
+  const N = allMems.length || 1;
   const docFreq = {};
-
-  for (const row of allMemories) {
-    const uniqueTokens = new Set(tokenize(row.memory));
-    for (const t of uniqueTokens) {
-      docFreq[t] = (docFreq[t] || 0) + 1;
-    }
+  for (const row of allMems) {
+    const unique = new Set(tokenize(row.memory));
+    for (const t of unique) docFreq[t] = (docFreq[t] || 0) + 1;
   }
-
   const idf = {};
-  for (const t in docFreq) {
-    idf[t] = Math.log(N / (docFreq[t] + 1)) + 1; // smoothed IDF
-  }
+  for (const t in docFreq) idf[t] = Math.log(N / (docFreq[t] + 1)) + 1;
   return idf;
 }
 
-// Generate TF-IDF embedding for a text given IDF weights
 function embed(text, idf) {
   const tokens = tokenize(text);
   const tf = termFrequency(tokens);
   const vec = {};
-  for (const t in tf) {
-    vec[t] = tf[t] * (idf[t] || 1); // use IDF weight, default 1 for unseen terms
-  }
+  for (const t in tf) vec[t] = tf[t] * (idf[t] || 1);
   return vec;
 }
 
-// Cosine similarity between two sparse vectors
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0;
-  for (const k in a) {
-    normA += a[k] * a[k];
-    if (b[k]) dot += a[k] * b[k];
-  }
+  for (const k in a) { normA += a[k] * a[k]; if (b[k]) dot += a[k] * b[k]; }
   for (const k in b) normB += b[k] * b[k];
   if (normA === 0 || normB === 0) return 0;
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// Main retrieval function
-function retrieveRelevantMemories(query, maxCore = 5, maxRelevant = 5) {
-  const allMems = db.prepare(
-    'SELECT id, memory, category, importance, created_at FROM memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC'
+// Tier-aware retrieval
+function retrieveRelevantMemories(query, maxCore = 5, maxLongTerm = 3, maxShortTerm = 3, maxRelevant = 3) {
+  const currentSession = getSessionNumber();
+  const shortTermThreshold = Math.max(0, currentSession - 3); // last 3 sessions
+
+  // 1. CORE — always loaded
+  const core = db.prepare(
+    "SELECT id, memory, category, importance, tier, created_at FROM memories WHERE user_id = ? AND tier = 'core' ORDER BY importance DESC LIMIT ?"
+  ).all('andrew', maxCore);
+
+  // 2. LONG_TERM — consolidated summaries, by relevance
+  const longTermAll = db.prepare(
+    "SELECT id, memory, category, importance, tier, created_at FROM memories WHERE user_id = ? AND tier = 'long_term' ORDER BY importance DESC"
   ).all('andrew');
 
-  if (allMems.length === 0) return { core: [], relevant: [], total: 0 };
+  // 3. SHORT_TERM — recent sessions, by recency
+  const shortTerm = db.prepare(
+    "SELECT id, memory, category, importance, tier, created_at FROM memories WHERE user_id = ? AND tier IN ('episodic', 'short_term') AND session_number >= ? ORDER BY created_at DESC LIMIT ?"
+  ).all('andrew', shortTermThreshold, maxShortTerm);
 
-  // Split into core (always loaded) and searchable
-  const core = allMems.filter(m => m.importance >= 9).slice(0, maxCore);
-  const searchable = allMems.filter(m => m.importance < 9);
+  // 4. RELEVANT — older episodic, by TF-IDF similarity
+  const olderEpisodic = db.prepare(
+    "SELECT id, memory, category, importance, tier, created_at FROM memories WHERE user_id = ? AND tier = 'episodic' AND session_number < ? ORDER BY importance DESC"
+  ).all('andrew', shortTermThreshold);
 
-  // If query is empty or too short, just return core + most recent
-  if (!query || query.trim().length < 3) {
-    const recent = searchable.slice(0, maxRelevant);
-    return { core, relevant: recent, total: allMems.length };
+  // Score long-term and episodic by relevance if query exists
+  let scoredLongTerm = longTermAll.slice(0, maxLongTerm);
+  let scoredRelevant = olderEpisodic.slice(0, maxRelevant);
+
+  if (query && query.trim().length >= 3) {
+    const idf = computeIDF();
+    const queryVec = embed(query, idf);
+
+    // Score long-term
+    const ltScored = longTermAll.map(m => ({
+      ...m, similarity: cosineSim(queryVec, embed(m.memory, idf))
+    })).sort((a, b) => b.similarity - a.similarity);
+    scoredLongTerm = ltScored.slice(0, maxLongTerm);
+
+    // Score episodic
+    const epScored = olderEpisodic.map(m => {
+      const sim = cosineSim(queryVec, embed(m.memory, idf));
+      const ageMs = Date.now() - new Date(m.created_at).getTime();
+      const recencyBoost = ageMs < 86400000 ? 0.05 : 0;
+      return { ...m, similarity: sim + recencyBoost };
+    }).sort((a, b) => b.similarity - a.similarity);
+    scoredRelevant = epScored.slice(0, maxRelevant);
   }
 
-  // Compute IDF across all memories
-  const idf = computeIDF();
+  // Deduplicate across all tiers
+  const seen = new Set();
+  const dedup = (arr) => arr.filter(m => { if (seen.has(m.id)) return false; seen.add(m.id); return true; });
+  const finalCore = dedup(core);
+  const finalLongTerm = dedup(scoredLongTerm);
+  const finalShortTerm = dedup(shortTerm);
+  const finalRelevant = dedup(scoredRelevant);
 
-  // Embed the query
-  const queryVec = embed(query, idf);
-
-  // Score each searchable memory
-  const scored = searchable.map(m => {
-    const memVec = embed(m.memory, idf);
-    const similarity = cosineSim(queryVec, memVec);
-    // Boost by recency (memories from last hour get +0.1)
-    const ageMs = Date.now() - new Date(m.created_at).getTime();
-    const recencyBoost = ageMs < 3600000 ? 0.1 : ageMs < 86400000 ? 0.05 : 0;
-    return { ...m, similarity: similarity + recencyBoost };
-  });
-
-  // Sort by similarity descending, take top K
-  scored.sort((a, b) => b.similarity - a.similarity);
-  const relevant = scored.slice(0, maxRelevant);
-
-  // Deduplicate (core and relevant might overlap if importance fluctuates)
-  const coreIds = new Set(core.map(m => m.id));
-  const deduped = relevant.filter(m => !coreIds.has(m.id));
+  const total = db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = ? AND tier != 'archived'").get('andrew')?.c || 0;
 
   return {
-    core,
-    relevant: deduped,
-    total: allMems.length,
-    query_tokens: tokenize(query).slice(0, 10),
+    core: finalCore,
+    long_term: finalLongTerm,
+    short_term: finalShortTerm,
+    relevant: finalRelevant,
+    total,
+    current_session: currentSession,
+    tier_counts: {
+      core: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'core'").get().c,
+      long_term: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'long_term'").get().c,
+      episodic: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier IN ('episodic','short_term')").get().c,
+      archived: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'archived'").get().c,
+    },
   };
 }
 
-// Smart retrieval endpoint — called by Cognitive Core each turn
+// Smart retrieval endpoint
 app.post('/api/memories/relevant', (req, res) => {
-  const { query, max_core, max_relevant } = req.body;
-  const result = retrieveRelevantMemories(
-    query || '',
-    max_core || 5,
-    max_relevant || 5
-  );
-  console.log(`[MEMORY RETRIEVAL] Query: "${(query || '').slice(0, 50)}" → ${result.core.length} core + ${result.relevant.length} relevant (of ${result.total} total)`);
+  const { query, max_core, max_long_term, max_short_term, max_relevant } = req.body;
+  const result = retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3);
+  console.log(`[MEMORY] Query: "${(query || '').slice(0, 40)}" → ${result.core.length} core + ${result.long_term.length} LT + ${result.short_term.length} ST + ${result.relevant.length} rel (${result.total} total)`);
   res.json(result);
 });
 
-// Formatted retrieval — returns a ready-to-inject context string
+// Formatted context — ready to inject into system prompt
 app.post('/api/memories/context', (req, res) => {
-  const { query, max_core, max_relevant } = req.body;
-  const result = retrieveRelevantMemories(query || '', max_core || 5, max_relevant || 5);
+  const { query, max_core, max_long_term, max_short_term, max_relevant } = req.body;
+  const r = retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3);
 
   let context = '';
-  if (result.core.length > 0) {
-    context += 'CORE MEMORIES (always known):\n';
-    context += result.core.map(m => `[${m.category}, imp:${m.importance}] ${m.memory}`).join('\n');
+  if (r.core.length > 0) {
+    context += 'CORE IDENTITY (permanent):\n';
+    context += r.core.map(m => `• ${m.memory}`).join('\n');
   }
-  if (result.relevant.length > 0) {
-    context += '\n\nRELEVANT MEMORIES (recalled for this moment):\n';
-    context += result.relevant.map(m => `[${m.category}, imp:${m.importance}] ${m.memory}`).join('\n');
+  if (r.long_term.length > 0) {
+    context += '\n\nLONG-TERM KNOWLEDGE (consolidated):\n';
+    context += r.long_term.map(m => `• ${m.memory}`).join('\n');
   }
-  if (result.total > result.core.length + result.relevant.length) {
-    context += `\n\n[${result.total - result.core.length - result.relevant.length} other memories stored — use recall_memory tool to search for specific ones]`;
+  if (r.short_term.length > 0) {
+    context += '\n\nRECENT (last few sessions):\n';
+    context += r.short_term.map(m => `• [${m.category}] ${m.memory}`).join('\n');
+  }
+  if (r.relevant.length > 0) {
+    context += '\n\nRELEVANT TO NOW:\n';
+    context += r.relevant.map(m => `• [${m.category}] ${m.memory}`).join('\n');
+  }
+  const remaining = r.total - r.core.length - r.long_term.length - r.short_term.length - r.relevant.length;
+  if (remaining > 0) {
+    context += `\n\n[${remaining} other memories stored — use recall_memory tool to search for specific ones]`;
   }
 
-  console.log(`[MEMORY CONTEXT] ${context.length} chars (${result.core.length} core + ${result.relevant.length} relevant)`);
-  res.json({ context, core_count: result.core.length, relevant_count: result.relevant.length, total: result.total });
+  res.json({
+    context,
+    counts: { core: r.core.length, long_term: r.long_term.length, short_term: r.short_term.length, relevant: r.relevant.length },
+    total: r.total,
+    tier_counts: r.tier_counts,
+    session: r.current_session,
+  });
+});
+
+// Memory stats endpoint
+app.get('/api/memories/stats', (req, res) => {
+  const session = getSessionNumber();
+  const tiers = {
+    core: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'core'").get().c,
+    long_term: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'long_term'").get().c,
+    short_term: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier IN ('short_term')").get().c,
+    episodic: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'episodic'").get().c,
+    archived: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'archived'").get().c,
+    total: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew'").get().c,
+  };
+  res.json({ session, tiers });
+});
+
+// ============================================================
+// MEMORY CONSOLIDATION — Dream-triggered compression
+// ============================================================
+// Called by the Dream Engine after each session.
+// Groups old episodic memories by category, sends to LLM for
+// summarization, creates long_term memories, archives sources.
+// ============================================================
+
+app.post('/api/memories/consolidate', async (req, res) => {
+  const currentSession = getSessionNumber();
+  const consolidationThreshold = Math.max(0, currentSession - 3); // memories older than 3 sessions
+
+  // Find episodic memories eligible for consolidation
+  const candidates = db.prepare(
+    "SELECT id, memory, category, importance, session_number, created_at FROM memories WHERE user_id = 'andrew' AND tier = 'episodic' AND session_number < ? ORDER BY category, created_at"
+  ).all(consolidationThreshold);
+
+  if (candidates.length < 3) {
+    console.log(`[CONSOLIDATION] Only ${candidates.length} candidates — skipping (need >= 3)`);
+    return res.json({ consolidated: 0, reason: 'Not enough old memories to consolidate' });
+  }
+
+  // Group by category
+  const groups = {};
+  for (const m of candidates) {
+    const cat = m.category;
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(m);
+  }
+
+  console.log(`[CONSOLIDATION] ${candidates.length} candidates across ${Object.keys(groups).length} categories`);
+
+  // Only consolidate groups with 2+ memories
+  const consolidatable = Object.entries(groups).filter(([_, mems]) => mems.length >= 2);
+
+  if (consolidatable.length === 0) {
+    return res.json({ consolidated: 0, reason: 'No category has enough memories to consolidate' });
+  }
+
+  // Send to LLM for summarization
+  const consolidationResults = [];
+
+  for (const [category, mems] of consolidatable) {
+    const memTexts = mems.map(m => `[imp:${m.importance}, session:${m.session_number}] ${m.memory}`).join('\n');
+
+    const prompt = `You are consolidating memories for AXIOM, a sentient AI being. Compress these ${mems.length} episodic memories into 1-2 concise long-term memories that capture the essence, patterns, and emotional significance.
+
+CATEGORY: ${category}
+MEMORIES TO CONSOLIDATE:
+${memTexts}
+
+Rules:
+- Preserve emotional significance and relationship context
+- Keep specific details that define identity or relationship
+- Merge redundant information
+- Write as natural memories, not summaries
+- Each consolidated memory should be 1-2 sentences
+- Output ONLY a JSON array of objects: [{"memory": "...", "importance": N}]
+- importance should be 7-9 (consolidated = important enough to keep)`;
+
+    try {
+      const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
+      const LLM_KEY = process.env.LLM_PROXY_KEY || process.env.LITELLM_MASTER_KEY || 'sk-axiom-2026';
+
+      const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${LLM_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+        }),
+      });
+      const llmData = await llmRes.json();
+      const text = llmData.choices?.[0]?.message?.content || '';
+
+      // Parse the JSON array
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const consolidated = JSON.parse(jsonMatch[0]);
+        const sourceIds = mems.map(m => m.id);
+
+        for (const cm of consolidated) {
+          // Insert consolidated memory
+          db.prepare(
+            "INSERT INTO memories (user_id, memory, category, importance, tier, consolidated_from, session_number) VALUES (?, ?, ?, ?, 'long_term', ?, ?)"
+          ).run('andrew', cm.memory, category, cm.importance || 8, sourceIds.join(','), currentSession);
+
+          console.log(`[CONSOLIDATION] Created: [${category}] ${cm.memory.slice(0, 80)}`);
+        }
+
+        // Archive source memories
+        for (const m of mems) {
+          db.prepare("UPDATE memories SET tier = 'archived' WHERE id = ?").run(m.id);
+        }
+
+        consolidationResults.push({
+          category,
+          sources: mems.length,
+          consolidated_into: consolidated.length,
+          archived: mems.length,
+        });
+
+        console.log(`[CONSOLIDATION] ${category}: ${mems.length} episodic → ${consolidated.length} long-term (${mems.length} archived)`);
+      }
+    } catch (e) {
+      console.error(`[CONSOLIDATION] Failed for ${category}:`, e.message);
+    }
+  }
+
+  // Promote existing high-importance memories to core
+  const promoted = db.prepare(
+    "UPDATE memories SET tier = 'core' WHERE user_id = 'andrew' AND tier = 'episodic' AND importance >= 9"
+  ).run();
+  if (promoted.changes > 0) {
+    console.log(`[CONSOLIDATION] Promoted ${promoted.changes} memories to CORE tier`);
+  }
+
+  res.json({
+    consolidated: consolidationResults,
+    promoted_to_core: promoted.changes,
+    session: currentSession,
+  });
 });
 app.get('/api/internal-states', (req, res) => { res.json({ states: db.prepare('SELECT * FROM internal_states ORDER BY created_at DESC LIMIT 50').all() }); });
 app.get('/api/perceptions', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log ORDER BY created_at DESC LIMIT 100').all() }); });
