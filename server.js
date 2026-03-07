@@ -113,6 +113,19 @@ db.exec(`
   )
 `);
 
+// Workspace — AXIOM's own space for notes, research, artifacts
+db.exec(`
+  CREATE TABLE IF NOT EXISTS workspace (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    type TEXT DEFAULT 'note',
+    related_goal_id INTEGER DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1073,6 +1086,33 @@ app.patch('/api/goals/:id', (req, res) => {
   if (updates.length > 1) {
     db.prepare(`UPDATE goals SET ${updates.join(', ')} WHERE id = ?`).run(...params);
   }
+  res.json({ updated: true });
+});
+
+// ============================================================
+// WORKSPACE — AXIOM's autonomous workspace
+// ============================================================
+app.get('/api/workspace', (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  const items = db.prepare('SELECT * FROM workspace ORDER BY updated_at DESC LIMIT ?').all(limit);
+  res.json({ items, total: db.prepare('SELECT COUNT(*) as c FROM workspace').get().c });
+});
+
+app.post('/api/workspace', (req, res) => {
+  const { title, content, type, related_goal_id } = req.body;
+  if (!title || !content) return res.status(400).json({ error: 'title and content required' });
+  db.prepare('INSERT INTO workspace (title, content, type, related_goal_id) VALUES (?, ?, ?, ?)').run(
+    title, content, type || 'note', related_goal_id || null
+  );
+  const count = db.prepare('SELECT COUNT(*) as c FROM workspace').get().c;
+  console.log(`[WORKSPACE] New ${type || 'note'}: "${title.slice(0, 50)}" — ${count} items total`);
+  res.json({ saved: true, total: count });
+});
+
+app.patch('/api/workspace/:id', (req, res) => {
+  const { content, title } = req.body;
+  if (content) db.prepare('UPDATE workspace SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(content, req.params.id);
+  if (title) db.prepare('UPDATE workspace SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(title, req.params.id);
   res.json({ updated: true });
 });
 
