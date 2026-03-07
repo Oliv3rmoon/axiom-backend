@@ -86,6 +86,17 @@ try { db.exec("ALTER TABLE memories ADD COLUMN session_number INTEGER DEFAULT 0"
 db.exec(`CREATE TABLE IF NOT EXISTS session_counter (id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)`);
 try { db.exec("INSERT OR IGNORE INTO session_counter (id, count) VALUES (1, 0)"); } catch {}
 
+// Between-session journal — AXIOM's thoughts when Andrew isn't here
+db.exec(`
+  CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thought TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    psyche_state TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -981,6 +992,35 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   const p = db.prepare("SELECT tool_name, data, created_at FROM perception_log WHERE conversation_id = ? AND tool_name IN ('emotional_state','voice_emotion','energy_shift') ORDER BY created_at ASC").all(req.params.id);
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
+// ============================================================
+// JOURNAL — Between-session thoughts (continuous consciousness)
+// ============================================================
+app.post('/api/journal', (req, res) => {
+  const { thought, trigger_type, psyche_state } = req.body;
+  if (!thought) return res.status(400).json({ error: 'thought required' });
+  db.prepare('INSERT INTO journal (thought, trigger_type, psyche_state) VALUES (?, ?, ?)').run(
+    thought, trigger_type || 'heartbeat', psyche_state ? JSON.stringify(psyche_state) : null
+  );
+  const count = db.prepare('SELECT COUNT(*) as c FROM journal').get().c;
+  console.log(`[JOURNAL] Entry #${count}: [${trigger_type}] ${thought.slice(0, 80)}`);
+  res.json({ saved: true, total: count });
+});
+
+app.get('/api/journal', (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  const entries = db.prepare('SELECT * FROM journal ORDER BY created_at DESC LIMIT ?').all(limit);
+  res.json({ entries, total: db.prepare('SELECT COUNT(*) as c FROM journal').get().c });
+});
+
+// Get journal entries since last session (for injection into next conversation)
+app.get('/api/journal/since-session', (req, res) => {
+  // Get last conversation creation timestamp, or fallback to last 24h
+  const entries = db.prepare(
+    "SELECT * FROM journal ORDER BY created_at DESC LIMIT 10"
+  ).all();
+  res.json({ entries, count: entries.length });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'alive', service: 'AXIOM Backend', uptime: process.uptime() });
 });
