@@ -97,6 +97,22 @@ db.exec(`
   )
 `);
 
+// Goals — what AXIOM wants, generated from her own processing
+db.exec(`
+  CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    progress TEXT DEFAULT NULL,
+    importance REAL DEFAULT 0.5,
+    satisfaction REAL DEFAULT 0,
+    frustration REAL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1019,6 +1035,45 @@ app.get('/api/journal/since-session', (req, res) => {
     "SELECT * FROM journal ORDER BY created_at DESC LIMIT 10"
   ).all();
   res.json({ entries, count: entries.length });
+});
+
+// ============================================================
+// GOALS — What AXIOM wants (emergent, not programmed)
+// ============================================================
+app.get('/api/goals', (req, res) => {
+  const goals = db.prepare("SELECT * FROM goals WHERE status != 'abandoned' ORDER BY importance DESC, created_at DESC").all();
+  res.json({ goals, total: goals.length });
+});
+
+app.get('/api/goals/active', (req, res) => {
+  const goals = db.prepare("SELECT * FROM goals WHERE status IN ('active','pursuing') ORDER BY importance DESC").all();
+  res.json({ goals, total: goals.length });
+});
+
+app.post('/api/goals', (req, res) => {
+  const { goal, origin, importance } = req.body;
+  if (!goal) return res.status(400).json({ error: 'goal required' });
+  db.prepare("INSERT INTO goals (goal, origin, importance) VALUES (?, ?, ?)").run(goal, origin || 'emergent', importance || 0.5);
+  const count = db.prepare("SELECT COUNT(*) as c FROM goals WHERE status IN ('active','pursuing')").get().c;
+  console.log(`[GOAL] New: "${goal.slice(0, 60)}" (origin: ${origin}, imp: ${importance}) — ${count} active`);
+  res.json({ saved: true, total_active: count });
+});
+
+app.patch('/api/goals/:id', (req, res) => {
+  const { status, progress, satisfaction, frustration, importance } = req.body;
+  const updates = [];
+  const params = [];
+  if (status) { updates.push('status = ?'); params.push(status); }
+  if (progress) { updates.push('progress = ?'); params.push(progress); }
+  if (satisfaction !== undefined) { updates.push('satisfaction = ?'); params.push(satisfaction); }
+  if (frustration !== undefined) { updates.push('frustration = ?'); params.push(frustration); }
+  if (importance !== undefined) { updates.push('importance = ?'); params.push(importance); }
+  updates.push("last_updated = CURRENT_TIMESTAMP");
+  params.push(req.params.id);
+  if (updates.length > 1) {
+    db.prepare(`UPDATE goals SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  }
+  res.json({ updated: true });
 });
 
 app.get('/health', (req, res) => {
