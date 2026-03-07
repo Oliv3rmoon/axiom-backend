@@ -505,6 +505,11 @@ app.get('/api/emotional-arc/:id', (req, res) => {
   res.json({ arc: p.map(x => ({ time: x.created_at, type: x.tool_name, data: JSON.parse(x.data) })) });
 });
 app.get('/health', (req, res) => {
+  res.json({ status: 'alive', service: 'AXIOM Backend', uptime: process.uptime() });
+});
+
+app.get('/', (req, res) => {
+  res.json({ name: 'AXIOM Backend', version: '2.0.0', status: 'alive' });
 });
 
 // REINFORCEMENT LEARNING ENDPOINTS
