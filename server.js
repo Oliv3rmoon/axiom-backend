@@ -126,6 +126,20 @@ db.exec(`
   )
 `);
 
+// Scribe v2 enriched transcripts — superior post-session transcription
+db.exec(`
+  CREATE TABLE IF NOT EXISTS scribe_transcripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    transcript_json TEXT NOT NULL,
+    speakers INTEGER DEFAULT 0,
+    language TEXT DEFAULT 'en',
+    word_count INTEGER DEFAULT 0,
+    duration_seconds REAL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -452,6 +466,101 @@ const perceptionHandlers = {
   }
 };
 
+// ============================================================
+// SCRIBE v2 — Post-session transcript reprocessing
+// ============================================================
+// ElevenLabs Scribe v2: 90+ languages, speaker diarization,
+// word-level timestamps, entity detection, audio event tagging.
+// Runs after session ends when recording becomes available.
+// ============================================================
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';
+
+async function scribeReprocess(conversationId, audioUrl) {
+  if (!ELEVENLABS_KEY) { console.log('[SCRIBE] No ElevenLabs API key — skipping'); return; }
+
+  console.log(`[SCRIBE] Downloading recording for ${conversationId}...`);
+
+  try {
+    // Download the recording
+    const audioRes = await fetch(audioUrl);
+    if (!audioRes.ok) { console.error(`[SCRIBE] Download failed: ${audioRes.status}`); return; }
+    const audioBuffer = await audioRes.arrayBuffer();
+    console.log(`[SCRIBE] Downloaded ${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)}MB`);
+
+    // Send to ElevenLabs Scribe v2
+    console.log(`[SCRIBE] Submitting to Scribe v2...`);
+    const formData = new FormData();
+    formData.append('file', new Blob([audioBuffer], { type: 'audio/mp4' }), 'recording.mp4');
+    formData.append('model_id', 'scribe_v2');
+    formData.append('diarize', 'true');
+    formData.append('tag_audio_events', 'true');
+    formData.append('timestamps_granularity', 'word');
+    formData.append('keyterms', JSON.stringify([
+      'AXIOM', 'Andrew', 'DPOC', 'Dulai', 'Stanford', 'Berkeley', 'Pierce College',
+      'Level 5', 'Tavus', 'Phoenix', 'Raven', 'Sparrow', 'consciousness', 'embodiment',
+      'Psyche', 'Dream Engine', 'Serafina', 'prefrontal', 'brainstem', 'cortex'
+    ]));
+
+    const scribeRes = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+      method: 'POST',
+      headers: { 'xi-api-key': ELEVENLABS_KEY },
+      body: formData,
+    });
+
+    if (!scribeRes.ok) {
+      const err = await scribeRes.text();
+      console.error(`[SCRIBE] API error ${scribeRes.status}: ${err.slice(0, 300)}`);
+      return;
+    }
+
+    const result = await scribeRes.json();
+    const text = result.text || '';
+    const words = result.words || [];
+    const speakers = [...new Set(words.map(w => w.speaker).filter(Boolean))];
+    const languages = result.language_code || result.detected_language || 'unknown';
+    const duration = words.length > 0 ? (words[words.length - 1].end || 0) : 0;
+
+    console.log(`[SCRIBE] ✅ Transcribed: ${text.length} chars, ${words.length} words, ${speakers.length} speakers, lang: ${languages}`);
+
+    // Store enriched transcript
+    db.prepare('INSERT INTO scribe_transcripts (conversation_id, transcript_json, speakers, language, word_count, duration_seconds) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(conversationId, JSON.stringify(result), speakers.length, languages, words.length, duration);
+
+    // Store individual utterances with speaker labels for better Dream Engine input
+    if (result.utterances) {
+      for (const utt of result.utterances) {
+        const speaker = utt.speaker || 'unknown';
+        const role = speaker === 'speaker_0' ? 'user' : 'assistant'; // First speaker = user typically
+        insertTranscript.run(conversationId + '_scribe', role, utt.text || '');
+      }
+      console.log(`[SCRIBE] Stored ${result.utterances.length} speaker-labeled utterances`);
+    }
+
+    console.log(`[SCRIBE] Post-session reprocessing complete for ${conversationId}`);
+  } catch (e) {
+    console.error(`[SCRIBE] Processing failed: ${e.message}`);
+  }
+}
+
+// Fallback: try to get recording URL from Tavus API
+async function fetchAndScribe(conversationId) {
+  try {
+    const tavusRes = await fetch(`https://tavusapi.com/v2/conversations/${conversationId}`, {
+      headers: { 'x-api-key': process.env.TAVUS_API_KEY },
+    });
+    const data = await tavusRes.json();
+    const recordingUrl = data.recording_url || data.video_url || null;
+    if (recordingUrl) {
+      console.log(`[SCRIBE] Found recording URL from Tavus API: ${recordingUrl.slice(0, 80)}`);
+      await scribeReprocess(conversationId, recordingUrl);
+    } else {
+      console.log(`[SCRIBE] No recording URL available yet for ${conversationId}`);
+    }
+  } catch (e) {
+    console.error(`[SCRIBE] Tavus fetch failed: ${e.message}`);
+  }
+}
+
 // MAIN WEBHOOK ENDPOINT
 app.post('/webhooks/tavus', async (req, res) => {
   const event = req.body;
@@ -501,7 +610,22 @@ app.post('/webhooks/tavus', async (req, res) => {
     }
 
     case 'application.transcription_ready': { console.log('[TRANSCRIPT] Ready'); res.json({ acknowledged: true }); return; }
-    case 'application.recording_ready': { console.log(`[RECORDING] ${event.properties?.s3_key}`); res.json({ acknowledged: true }); return; }
+    case 'application.recording_ready': {
+      const recordingUrl = event.properties?.recording_url || event.properties?.url || null;
+      const s3Key = event.properties?.s3_key || null;
+      console.log(`[RECORDING] Ready | URL: ${recordingUrl?.slice(0, 80) || 'none'} | S3: ${s3Key || 'none'}`);
+      console.log(`[RECORDING] Full properties: ${JSON.stringify(event.properties).slice(0, 500)}`);
+
+      // Trigger Scribe v2 reprocessing asynchronously
+      if (recordingUrl) {
+        scribeReprocess(conversationId, recordingUrl).catch(e => console.error('[SCRIBE] Error:', e.message));
+      } else {
+        console.log('[SCRIBE] No recording URL — will try to fetch from Tavus API');
+        // Try fetching recording URL from Tavus conversation endpoint
+        fetchAndScribe(conversationId).catch(e => console.error('[SCRIBE] Fetch error:', e.message));
+      }
+      res.json({ acknowledged: true }); return;
+    }
     case 'application.perception_analysis': {
       console.log('[PERCEPTION SUMMARY]', JSON.stringify(event.properties, null, 2).slice(0, 500));
       insertPerception.run(conversationId, 'session_summary', JSON.stringify(event.properties));
@@ -1115,6 +1239,28 @@ app.patch('/api/workspace/:id', (req, res) => {
   if (content) db.prepare('UPDATE workspace SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(content, req.params.id);
   if (title) db.prepare('UPDATE workspace SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(title, req.params.id);
   res.json({ updated: true });
+});
+
+// ============================================================
+// SCRIBE v2 — Enriched transcript endpoints
+// ============================================================
+app.get('/api/scribe/:conversationId', (req, res) => {
+  const row = db.prepare('SELECT * FROM scribe_transcripts WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1').get(req.params.conversationId);
+  if (!row) return res.json({ found: false });
+  res.json({ found: true, ...row, transcript: JSON.parse(row.transcript_json) });
+});
+
+app.get('/api/scribe', (req, res) => {
+  const rows = db.prepare('SELECT conversation_id, speakers, language, word_count, duration_seconds, created_at FROM scribe_transcripts ORDER BY created_at DESC LIMIT 20').all();
+  res.json({ transcripts: rows, total: rows.length });
+});
+
+// Manual trigger — reprocess a recording URL through Scribe v2
+app.post('/api/scribe/reprocess', async (req, res) => {
+  const { conversation_id, recording_url } = req.body;
+  if (!recording_url) return res.status(400).json({ error: 'recording_url required' });
+  scribeReprocess(conversation_id || 'manual', recording_url).catch(e => console.error('[SCRIBE]', e.message));
+  res.json({ status: 'processing', message: 'Scribe v2 reprocessing started' });
 });
 
 app.get('/health', (req, res) => {
