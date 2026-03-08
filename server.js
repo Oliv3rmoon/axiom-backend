@@ -751,6 +751,20 @@ app.post('/api/create-conversation', async (req, res) => {
 // API ENDPOINTS
 app.get('/api/memories', (req, res) => { res.json({ memories: getAllMemories.all('andrew') }); });
 
+// Direct memory save endpoint — used by Cognitive Core's memory extraction system
+app.post('/api/memories', (req, res) => {
+  const { memory, category, importance, user_id } = req.body;
+  if (!memory) return res.status(400).json({ error: 'memory required' });
+  const session = getSessionNumber();
+  insertMemory.run(user_id || 'andrew', 'core-extract', memory, category || 'personal_detail', importance || 5, session);
+  if (importance >= 9) {
+    const lastId = db.prepare('SELECT last_insert_rowid() as id').get().id;
+    db.prepare("UPDATE memories SET tier = 'core' WHERE id = ?").run(lastId);
+  }
+  console.log(`[MEMORY] Direct save: "${memory.slice(0, 60)}" (${category}, imp:${importance}, session:${session})`);
+  res.json({ acknowledged: true });
+});
+
 // ============================================================
 // MEMORY HIERARCHY — Tiered Retrieval + Consolidation
 // ============================================================
