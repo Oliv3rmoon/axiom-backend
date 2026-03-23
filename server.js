@@ -198,6 +198,25 @@ db.exec(`
   )
 `);
 
+// Code Proposals — AXIOM's self-improvement suggestions
+db.exec(`
+  CREATE TABLE IF NOT EXISTS code_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    old_code TEXT DEFAULT NULL,
+    new_code TEXT DEFAULT NULL,
+    rationale TEXT NOT NULL,
+    source_goal_id INTEGER DEFAULT NULL,
+    status TEXT DEFAULT 'proposed',
+    review_notes TEXT DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at DATETIME DEFAULT NULL
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1509,6 +1528,54 @@ app.post('/api/knowledge/relevant', (req, res) => {
     db.prepare('UPDATE knowledge_nodes SET access_count = access_count + 1 WHERE id = ?').run(n.id);
   }
   res.json({ nodes });
+});
+
+// ============================================================
+// CODE PROPOSALS — AXIOM's self-improvement suggestions
+// ============================================================
+
+// Get all proposals
+app.get('/api/proposals', (req, res) => {
+  const status = req.query.status || 'all';
+  const proposals = status === 'all'
+    ? db.prepare('SELECT * FROM code_proposals ORDER BY created_at DESC LIMIT 50').all()
+    : db.prepare('SELECT * FROM code_proposals WHERE status = ? ORDER BY created_at DESC LIMIT 50').all(status);
+  res.json({ proposals, total: proposals.length });
+});
+
+// Proposal stats (before :id route)
+app.get('/api/proposals/stats', (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) as c FROM code_proposals').get().c;
+  const byStatus = db.prepare('SELECT status, COUNT(*) as count FROM code_proposals GROUP BY status').all();
+  const byRepo = db.prepare('SELECT repo, COUNT(*) as count FROM code_proposals GROUP BY repo ORDER BY count DESC').all();
+  res.json({ total, by_status: byStatus, by_repo: byRepo });
+});
+
+// Get a single proposal
+app.get('/api/proposals/:id', (req, res) => {
+  const p = db.prepare('SELECT * FROM code_proposals WHERE id = ?').get(req.params.id);
+  if (!p) return res.json({ found: false });
+  res.json({ found: true, proposal: p });
+});
+
+// Create a proposal
+app.post('/api/proposals', (req, res) => {
+  const { repo, file_path, title, description, old_code, new_code, rationale, source_goal_id } = req.body;
+  if (!repo || !title || !rationale) return res.status(400).json({ error: 'repo, title, rationale required' });
+  const result = db.prepare(
+    'INSERT INTO code_proposals (repo, file_path, title, description, old_code, new_code, rationale, source_goal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(repo, file_path || '', title, description || '', old_code || null, new_code || null, rationale, source_goal_id || null);
+  console.log(`[PROPOSAL] New: "${title}" for ${repo}/${file_path}`);
+  res.json({ created: true, id: result.lastInsertRowid });
+});
+
+// Review a proposal (approve/reject/defer)
+app.patch('/api/proposals/:id', (req, res) => {
+  const { status, review_notes } = req.body;
+  if (!status) return res.status(400).json({ error: 'status required' });
+  db.prepare('UPDATE code_proposals SET status = ?, review_notes = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .run(status, review_notes || null, req.params.id);
+  res.json({ updated: true });
 });
 
 // ============================================================
