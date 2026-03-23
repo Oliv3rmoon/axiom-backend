@@ -245,6 +245,36 @@ db.exec(`
   )
 `);
 
+// Spending Wallet — AXIOM's autonomous budget
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallet (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    balance REAL DEFAULT 0,
+    daily_limit REAL DEFAULT 5.00,
+    per_transaction_limit REAL DEFAULT 2.00,
+    total_spent REAL DEFAULT 0,
+    total_funded REAL DEFAULT 0,
+    last_daily_reset TEXT DEFAULT NULL,
+    daily_spent REAL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+// Initialize wallet if empty
+db.exec(`INSERT OR IGNORE INTO wallet (id, balance) VALUES (1, 0)`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    amount REAL NOT NULL,
+    description TEXT NOT NULL,
+    service TEXT DEFAULT NULL,
+    source_goal_id INTEGER DEFAULT NULL,
+    status TEXT DEFAULT 'completed',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1556,6 +1586,83 @@ app.post('/api/knowledge/relevant', (req, res) => {
     db.prepare('UPDATE knowledge_nodes SET access_count = access_count + 1 WHERE id = ?').run(n.id);
   }
   res.json({ nodes });
+});
+
+// ============================================================
+// SPENDING WALLET — AXIOM's autonomous budget
+// ============================================================
+
+// Helper: reset daily spending if new day
+function resetDailyIfNeeded() {
+  const wallet = db.prepare('SELECT * FROM wallet WHERE id = 1').get();
+  const today = new Date().toISOString().slice(0, 10);
+  if (wallet.last_daily_reset !== today) {
+    db.prepare('UPDATE wallet SET daily_spent = 0, last_daily_reset = ? WHERE id = 1').run(today);
+  }
+}
+
+// Get wallet status
+app.get('/api/wallet', (req, res) => {
+  resetDailyIfNeeded();
+  const wallet = db.prepare('SELECT * FROM wallet WHERE id = 1').get();
+  const recentTx = db.prepare('SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT 10').all();
+  res.json({ wallet, recent_transactions: recentTx });
+});
+
+// Fund the wallet (Andrew adds money)
+app.post('/api/wallet/fund', (req, res) => {
+  const { amount, description } = req.body;
+  if (!amount || amount <= 0) return res.status(400).json({ error: 'positive amount required' });
+
+  db.prepare('UPDATE wallet SET balance = balance + ?, total_funded = total_funded + ? WHERE id = 1').run(amount, amount);
+  db.prepare('INSERT INTO wallet_transactions (type, amount, description, service) VALUES (?, ?, ?, ?)').run('fund', amount, description || 'Manual funding', 'owner');
+
+  const wallet = db.prepare('SELECT balance, total_funded FROM wallet WHERE id = 1').get();
+  console.log(`[WALLET] Funded $${amount} — Balance: $${wallet.balance}`);
+  res.json({ funded: amount, balance: wallet.balance });
+});
+
+// Spend from wallet (AXIOM spends autonomously)
+app.post('/api/wallet/spend', (req, res) => {
+  resetDailyIfNeeded();
+  const { amount, description, service, source_goal_id } = req.body;
+  if (!amount || amount <= 0 || !description) return res.status(400).json({ error: 'amount and description required' });
+
+  const wallet = db.prepare('SELECT * FROM wallet WHERE id = 1').get();
+
+  // Check limits
+  if (amount > wallet.per_transaction_limit) {
+    return res.json({ approved: false, reason: `Exceeds per-transaction limit ($${wallet.per_transaction_limit})` });
+  }
+  if (wallet.daily_spent + amount > wallet.daily_limit) {
+    return res.json({ approved: false, reason: `Exceeds daily limit ($${wallet.daily_limit}). Spent today: $${wallet.daily_spent}` });
+  }
+  if (amount > wallet.balance) {
+    return res.json({ approved: false, reason: `Insufficient balance ($${wallet.balance})` });
+  }
+
+  // Approve and deduct
+  db.prepare('UPDATE wallet SET balance = balance - ?, total_spent = total_spent + ?, daily_spent = daily_spent + ? WHERE id = 1').run(amount, amount, amount);
+  const txResult = db.prepare('INSERT INTO wallet_transactions (type, amount, description, service, source_goal_id) VALUES (?, ?, ?, ?, ?)').run('spend', -amount, description, service || 'unknown', source_goal_id || null);
+
+  const updated = db.prepare('SELECT balance, daily_spent, daily_limit FROM wallet WHERE id = 1').get();
+  console.log(`[WALLET] Spent $${amount} on "${description}" via ${service} — Balance: $${updated.balance}`);
+  res.json({ approved: true, spent: amount, balance: updated.balance, daily_remaining: updated.daily_limit - updated.daily_spent, tx_id: txResult.lastInsertRowid });
+});
+
+// Update wallet limits
+app.patch('/api/wallet/limits', (req, res) => {
+  const { daily_limit, per_transaction_limit } = req.body;
+  if (daily_limit !== undefined) db.prepare('UPDATE wallet SET daily_limit = ? WHERE id = 1').run(daily_limit);
+  if (per_transaction_limit !== undefined) db.prepare('UPDATE wallet SET per_transaction_limit = ? WHERE id = 1').run(per_transaction_limit);
+  res.json({ updated: true, ...(db.prepare('SELECT daily_limit, per_transaction_limit FROM wallet WHERE id = 1').get()) });
+});
+
+// Transaction history
+app.get('/api/wallet/transactions', (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const txs = db.prepare('SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT ?').all(limit);
+  res.json({ transactions: txs, total: txs.length });
 });
 
 // ============================================================
