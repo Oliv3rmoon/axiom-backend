@@ -269,11 +269,14 @@ db.exec(`
     amount REAL NOT NULL,
     description TEXT NOT NULL,
     service TEXT DEFAULT NULL,
+    tier INTEGER DEFAULT NULL,
     source_goal_id INTEGER DEFAULT NULL,
     status TEXT DEFAULT 'completed',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+// Add tier column if missing (existing DBs)
+try { db.exec(`ALTER TABLE wallet_transactions ADD COLUMN tier INTEGER DEFAULT NULL`); } catch(e) {}
 
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
@@ -1625,7 +1628,7 @@ app.post('/api/wallet/fund', (req, res) => {
 // Spend from wallet (AXIOM spends autonomously)
 app.post('/api/wallet/spend', (req, res) => {
   resetDailyIfNeeded();
-  const { amount, description, service, source_goal_id } = req.body;
+  const { amount, description, service, source_goal_id, tier } = req.body;
   if (!amount || amount <= 0 || !description) return res.status(400).json({ error: 'amount and description required' });
 
   const wallet = db.prepare('SELECT * FROM wallet WHERE id = 1').get();
@@ -1643,11 +1646,43 @@ app.post('/api/wallet/spend', (req, res) => {
 
   // Approve and deduct
   db.prepare('UPDATE wallet SET balance = balance - ?, total_spent = total_spent + ?, daily_spent = daily_spent + ? WHERE id = 1').run(amount, amount, amount);
-  const txResult = db.prepare('INSERT INTO wallet_transactions (type, amount, description, service, source_goal_id) VALUES (?, ?, ?, ?, ?)').run('spend', -amount, description, service || 'unknown', source_goal_id || null);
+  const txResult = db.prepare('INSERT INTO wallet_transactions (type, amount, description, service, tier, source_goal_id) VALUES (?, ?, ?, ?, ?, ?)').run('spend', -amount, description, service || 'unknown', tier || null, source_goal_id || null);
 
   const updated = db.prepare('SELECT balance, daily_spent, daily_limit FROM wallet WHERE id = 1').get();
-  console.log(`[WALLET] Spent $${amount} on "${description}" via ${service} — Balance: $${updated.balance}`);
+  console.log(`[WALLET] [T${tier||'?'}] Spent $${amount} on "${description}" via ${service} — Balance: $${updated.balance}`);
   res.json({ approved: true, spent: amount, balance: updated.balance, daily_remaining: updated.daily_limit - updated.daily_spent, tx_id: txResult.lastInsertRowid });
+});
+
+// Wallet spending breakdown by tier
+app.get('/api/wallet/tiers', (req, res) => {
+  const tierStats = db.prepare(`
+    SELECT tier, COUNT(*) as count, SUM(ABS(amount)) as total_spent
+    FROM wallet_transactions WHERE type = 'spend' GROUP BY tier
+  `).all();
+  const services = db.prepare(`
+    SELECT service, tier, COUNT(*) as count, SUM(ABS(amount)) as total_spent
+    FROM wallet_transactions WHERE type = 'spend' GROUP BY service, tier ORDER BY total_spent DESC
+  `).all();
+  res.json({ tier_breakdown: tierStats, service_breakdown: services });
+});
+
+// Configured services status
+app.get('/api/wallet/services', (req, res) => {
+  res.json({
+    tier_1_api: {
+      railway: { configured: !!process.env.RAILWAY_API_TOKEN, description: 'Compute, services, databases' },
+      cloudflare: { configured: !!process.env.CLOUDFLARE_API_TOKEN, description: 'Domains, DNS, R2 storage' },
+      elevenlabs: { configured: true, description: 'Voice generation credits' },
+      github: { configured: !!process.env.GITHUB_PAT, description: 'Repos, actions, pages' },
+      vercel: { configured: !!process.env.VERCEL_TOKEN, description: 'Frontend deployments, domains' },
+    },
+    tier_2_card: {
+      privacy_com: { configured: !!process.env.PRIVACY_API_KEY, description: 'Virtual debit cards for any online merchant' },
+    },
+    tier_3_browser: {
+      headless_chrome: { configured: !!process.env.BROWSER_URL, description: 'Automated web checkout via Puppeteer' },
+    },
+  });
 });
 
 // Update wallet limits
