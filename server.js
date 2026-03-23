@@ -1433,6 +1433,15 @@ app.get('/api/knowledge/search', (req, res) => {
   res.json({ nodes, total: nodes.length });
 });
 
+// Knowledge stats (must be before /:id to avoid route capture)
+app.get('/api/knowledge/stats', (req, res) => {
+  const nodeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_nodes').get().c;
+  const edgeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_edges').get().c;
+  const categories = db.prepare('SELECT category, COUNT(*) as count FROM knowledge_nodes GROUP BY category ORDER BY count DESC').all();
+  const topAccessed = db.prepare('SELECT concept, access_count, confidence FROM knowledge_nodes ORDER BY access_count DESC LIMIT 5').all();
+  res.json({ nodes: nodeCount, edges: edgeCount, categories, top_accessed: topAccessed });
+});
+
 // Get a node with its connections
 app.get('/api/knowledge/:id', (req, res) => {
   const node = db.prepare('SELECT * FROM knowledge_nodes WHERE id = ?').get(req.params.id);
@@ -1484,14 +1493,6 @@ app.post('/api/knowledge/edge', (req, res) => {
 });
 
 // Get knowledge stats
-app.get('/api/knowledge/stats', (req, res) => {
-  const nodeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_nodes').get().c;
-  const edgeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_edges').get().c;
-  const categories = db.prepare('SELECT category, COUNT(*) as count FROM knowledge_nodes GROUP BY category ORDER BY count DESC').all();
-  const topAccessed = db.prepare('SELECT concept, access_count, confidence FROM knowledge_nodes ORDER BY access_count DESC LIMIT 5').all();
-  res.json({ nodes: nodeCount, edges: edgeCount, categories, top_accessed: topAccessed });
-});
-
 // Get related concepts for a query (for conversation injection)
 app.post('/api/knowledge/relevant', (req, res) => {
   const { query } = req.body;
