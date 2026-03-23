@@ -1669,6 +1669,7 @@ app.get('/api/wallet/services', (req, res) => {
       elevenlabs: { configured: true, description: 'Voice generation credits' },
       github: { configured: !!process.env.GITHUB_PAT, description: 'Repos, actions, pages' },
       vercel: { configured: !!process.env.VERCEL_TOKEN, description: 'Frontend deployments, domains' },
+      runpod: { configured: !!process.env.RUNPOD_API_KEY, description: 'GPU/CPU pods, serverless endpoints, persistent compute' },
     },
     tier_2_card: {
       lithic: { configured: !!process.env.LITHIC_API_KEY, description: 'Virtual debit card issuing — single-use cards with spend limits' },
