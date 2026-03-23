@@ -1677,7 +1677,7 @@ app.get('/api/wallet/services', (req, res) => {
       vercel: { configured: !!process.env.VERCEL_TOKEN, description: 'Frontend deployments, domains' },
     },
     tier_2_card: {
-      privacy_com: { configured: !!process.env.PRIVACY_API_KEY, description: 'Virtual debit cards for any online merchant' },
+      lithic: { configured: !!process.env.LITHIC_API_KEY, description: 'Virtual debit card issuing — single-use cards with spend limits' },
     },
     tier_3_browser: {
       headless_chrome: { configured: !!process.env.BROWSER_URL, description: 'Automated web checkout via Puppeteer' },
