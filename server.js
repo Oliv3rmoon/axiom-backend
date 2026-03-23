@@ -1633,13 +1633,7 @@ app.post('/api/wallet/spend', (req, res) => {
 
   const wallet = db.prepare('SELECT * FROM wallet WHERE id = 1').get();
 
-  // Check limits
-  if (amount > wallet.per_transaction_limit) {
-    return res.json({ approved: false, reason: `Exceeds per-transaction limit ($${wallet.per_transaction_limit})` });
-  }
-  if (wallet.daily_spent + amount > wallet.daily_limit) {
-    return res.json({ approved: false, reason: `Exceeds daily limit ($${wallet.daily_limit}). Spent today: $${wallet.daily_spent}` });
-  }
+  // Only check balance — card has its own hard limit
   if (amount > wallet.balance) {
     return res.json({ approved: false, reason: `Insufficient balance ($${wallet.balance})` });
   }
@@ -1650,7 +1644,7 @@ app.post('/api/wallet/spend', (req, res) => {
 
   const updated = db.prepare('SELECT balance, daily_spent, daily_limit FROM wallet WHERE id = 1').get();
   console.log(`[WALLET] [T${tier||'?'}] Spent $${amount} on "${description}" via ${service} — Balance: $${updated.balance}`);
-  res.json({ approved: true, spent: amount, balance: updated.balance, daily_remaining: updated.daily_limit - updated.daily_spent, tx_id: txResult.lastInsertRowid });
+  res.json({ approved: true, spent: amount, balance: updated.balance, tx_id: txResult.lastInsertRowid });
 });
 
 // Wallet spending breakdown by tier
