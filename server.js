@@ -140,6 +140,36 @@ db.exec(`
   )
 `);
 
+// Execution Plans — structured multi-step plans for goals
+db.exec(`
+  CREATE TABLE IF NOT EXISTS execution_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'active',
+    current_step INTEGER DEFAULT 1,
+    total_steps INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// Plan Steps — individual actions within a plan
+db.exec(`
+  CREATE TABLE IF NOT EXISTS plan_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id INTEGER NOT NULL,
+    step_number INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    description TEXT NOT NULL,
+    query TEXT DEFAULT NULL,
+    expected_outcome TEXT DEFAULT NULL,
+    status TEXT DEFAULT 'pending',
+    result TEXT DEFAULT NULL,
+    completed_at DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1273,6 +1303,80 @@ app.patch('/api/workspace/:id', (req, res) => {
   if (content) db.prepare('UPDATE workspace SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(content, req.params.id);
   if (title) db.prepare('UPDATE workspace SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(title, req.params.id);
   res.json({ updated: true });
+});
+
+// ============================================================
+// EXECUTION PLANNER — Structured goal pursuit
+// ============================================================
+
+// Get plan for a goal
+app.get('/api/plans/goal/:goalId', (req, res) => {
+  const plan = db.prepare('SELECT * FROM execution_plans WHERE goal_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1').get(req.params.goalId, 'active');
+  if (!plan) return res.json({ found: false });
+  const steps = db.prepare('SELECT * FROM plan_steps WHERE plan_id = ? ORDER BY step_number ASC').all(plan.id);
+  res.json({ found: true, plan, steps });
+});
+
+// Get all active plans
+app.get('/api/plans', (req, res) => {
+  const plans = db.prepare('SELECT ep.*, g.goal FROM execution_plans ep JOIN goals g ON ep.goal_id = g.id WHERE ep.status = ? ORDER BY ep.updated_at DESC').all('active');
+  for (const p of plans) {
+    p.steps = db.prepare('SELECT * FROM plan_steps WHERE plan_id = ? ORDER BY step_number ASC').all(p.id);
+  }
+  res.json({ plans, total: plans.length });
+});
+
+// Create a plan for a goal
+app.post('/api/plans', (req, res) => {
+  const { goal_id, steps } = req.body;
+  if (!goal_id || !steps || !steps.length) return res.status(400).json({ error: 'goal_id and steps required' });
+
+  // Archive any existing plan for this goal
+  db.prepare("UPDATE execution_plans SET status = 'replaced', updated_at = CURRENT_TIMESTAMP WHERE goal_id = ? AND status = 'active'").run(goal_id);
+
+  // Create new plan
+  const result = db.prepare('INSERT INTO execution_plans (goal_id, total_steps, current_step) VALUES (?, ?, 1)').run(goal_id, steps.length);
+  const planId = result.lastInsertRowid;
+
+  // Insert steps
+  const insertStep = db.prepare('INSERT INTO plan_steps (plan_id, step_number, action, description, query, expected_outcome) VALUES (?, ?, ?, ?, ?, ?)');
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    insertStep.run(planId, i + 1, s.action || 'research', s.description, s.query || null, s.expected_outcome || null);
+  }
+
+  console.log(`[PLAN] Created plan ${planId} for goal ${goal_id}: ${steps.length} steps`);
+  res.json({ plan_id: planId, steps_created: steps.length });
+});
+
+// Get next step to execute for a goal
+app.get('/api/plans/next/:goalId', (req, res) => {
+  const plan = db.prepare('SELECT * FROM execution_plans WHERE goal_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1').get(req.params.goalId, 'active');
+  if (!plan) return res.json({ found: false, reason: 'no plan' });
+
+  const nextStep = db.prepare("SELECT * FROM plan_steps WHERE plan_id = ? AND status = 'pending' ORDER BY step_number ASC LIMIT 1").get(plan.id);
+  if (!nextStep) {
+    // All steps done — mark plan complete
+    db.prepare("UPDATE execution_plans SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(plan.id);
+    return res.json({ found: false, reason: 'plan complete', plan_id: plan.id });
+  }
+
+  res.json({ found: true, step: nextStep, plan_id: plan.id, progress: `${plan.current_step}/${plan.total_steps}` });
+});
+
+// Complete a step
+app.post('/api/plans/complete-step/:stepId', (req, res) => {
+  const { result } = req.body;
+  db.prepare("UPDATE plan_steps SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?").run(result || '', req.params.stepId);
+
+  // Get the step to find its plan
+  const step = db.prepare('SELECT * FROM plan_steps WHERE id = ?').get(req.params.stepId);
+  if (step) {
+    // Advance current_step on the plan
+    db.prepare('UPDATE execution_plans SET current_step = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(step.step_number + 1, step.plan_id);
+  }
+
+  res.json({ completed: true });
 });
 
 // ============================================================
