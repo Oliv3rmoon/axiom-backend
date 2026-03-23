@@ -1678,6 +1678,7 @@ app.get('/api/wallet/services', (req, res) => {
     },
     tier_2_card: {
       lithic: { configured: !!process.env.LITHIC_API_KEY, description: 'Virtual debit card issuing — single-use cards with spend limits' },
+      configured_card: { configured: !!process.env.CARD_PAN, description: 'Pre-loaded card from env vars (fallback when no Lithic)' },
     },
     tier_3_browser: {
       headless_chrome: { configured: !!process.env.BROWSER_URL, description: 'Automated web checkout via Puppeteer' },
