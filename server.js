@@ -1678,6 +1678,18 @@ app.get('/api/wallet/services', (req, res) => {
     tier_3_browser: {
       headless_chrome: { configured: !!process.env.BROWSER_URL, description: 'Automated web checkout via Puppeteer' },
     },
+    communications: {
+      email: { configured: !!process.env.RESEND_KEY, description: 'Send emails via Resend API' },
+      notifications: { configured: !!(process.env.NOTIFY_WEBHOOK || process.env.NOTIFY_EMAIL), description: 'Alert Andrew via webhook/email' },
+    },
+    capabilities: {
+      monitoring: { configured: !!process.env.BROWSER_URL, description: 'Watch websites for changes' },
+      documents: { configured: !!process.env.GITHUB_PAT, description: 'Create and host documents on GitHub' },
+      persistent_compute: { configured: !!process.env.RUNPOD_API_KEY, description: 'GPU/CPU pods via RunPod' },
+      code_agent: { configured: !!process.env.GITHUB_PAT, description: 'Read, audit, and modify own code' },
+      sandbox: { configured: true, description: 'Test code before committing' },
+      browser: { configured: !!process.env.BROWSER_URL, description: 'Browse any website interactively' },
+    },
   });
 });
 
