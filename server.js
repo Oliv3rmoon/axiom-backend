@@ -170,6 +170,34 @@ db.exec(`
   )
 `);
 
+// Knowledge Graph — structured, interconnected knowledge
+db.exec(`
+  CREATE TABLE IF NOT EXISTS knowledge_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept TEXT NOT NULL,
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details TEXT DEFAULT NULL,
+    source TEXT DEFAULT NULL,
+    source_goal_id INTEGER DEFAULT NULL,
+    confidence REAL DEFAULT 0.7,
+    access_count INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS knowledge_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_node_id INTEGER NOT NULL,
+    to_node_id INTEGER NOT NULL,
+    relation TEXT NOT NULL,
+    strength REAL DEFAULT 0.5,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function getSessionNumber() {
   return db.prepare('SELECT count FROM session_counter WHERE id = 1').get()?.count || 0;
 }
@@ -1377,6 +1405,109 @@ app.post('/api/plans/complete-step/:stepId', (req, res) => {
   }
 
   res.json({ completed: true });
+});
+
+// ============================================================
+// KNOWLEDGE GRAPH — Structured, interconnected knowledge
+// ============================================================
+
+// Get all nodes (optionally filter by category)
+app.get('/api/knowledge', (req, res) => {
+  const cat = req.query.category;
+  const nodes = cat
+    ? db.prepare('SELECT * FROM knowledge_nodes WHERE category = ? ORDER BY access_count DESC, confidence DESC').all(cat)
+    : db.prepare('SELECT * FROM knowledge_nodes ORDER BY access_count DESC, confidence DESC LIMIT 100').all();
+  res.json({ nodes, total: nodes.length });
+});
+
+// Search knowledge by concept or content
+app.get('/api/knowledge/search', (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.json({ nodes: [] });
+  const nodes = db.prepare("SELECT * FROM knowledge_nodes WHERE concept LIKE ? OR summary LIKE ? OR details LIKE ? ORDER BY confidence DESC LIMIT 20")
+    .all(`%${q}%`, `%${q}%`, `%${q}%`);
+  // Bump access count
+  for (const n of nodes) {
+    db.prepare('UPDATE knowledge_nodes SET access_count = access_count + 1 WHERE id = ?').run(n.id);
+  }
+  res.json({ nodes, total: nodes.length });
+});
+
+// Get a node with its connections
+app.get('/api/knowledge/:id', (req, res) => {
+  const node = db.prepare('SELECT * FROM knowledge_nodes WHERE id = ?').get(req.params.id);
+  if (!node) return res.json({ found: false });
+  const edges_out = db.prepare('SELECT ke.*, kn.concept as to_concept, kn.category as to_category FROM knowledge_edges ke JOIN knowledge_nodes kn ON ke.to_node_id = kn.id WHERE ke.from_node_id = ?').all(node.id);
+  const edges_in = db.prepare('SELECT ke.*, kn.concept as from_concept, kn.category as from_category FROM knowledge_edges ke JOIN knowledge_nodes kn ON ke.from_node_id = kn.id WHERE ke.to_node_id = ?').all(node.id);
+  db.prepare('UPDATE knowledge_nodes SET access_count = access_count + 1 WHERE id = ?').run(node.id);
+  res.json({ found: true, node, connections: { outgoing: edges_out, incoming: edges_in } });
+});
+
+// Add a knowledge node
+app.post('/api/knowledge', (req, res) => {
+  const { concept, category, summary, details, source, source_goal_id, confidence } = req.body;
+  if (!concept || !summary) return res.status(400).json({ error: 'concept and summary required' });
+
+  // Check for existing node with same concept
+  const existing = db.prepare('SELECT * FROM knowledge_nodes WHERE concept = ?').get(concept);
+  if (existing) {
+    // Merge — append details, update confidence
+    const merged = (existing.details || '') + '\n\n---\n\n' + (details || summary);
+    const newConf = Math.min(1, (existing.confidence + (confidence || 0.7)) / 2 + 0.1);
+    db.prepare('UPDATE knowledge_nodes SET details = ?, confidence = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(merged.slice(0, 10000), newConf, summary, existing.id);
+    console.log(`[KNOWLEDGE] Merged into "${concept}" (conf: ${newConf.toFixed(2)})`);
+    return res.json({ merged: true, id: existing.id });
+  }
+
+  const result = db.prepare('INSERT INTO knowledge_nodes (concept, category, summary, details, source, source_goal_id, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(concept, category || 'general', summary, details || null, source || null, source_goal_id || null, confidence || 0.7);
+  console.log(`[KNOWLEDGE] New node: "${concept}" (${category})`);
+  res.json({ created: true, id: result.lastInsertRowid });
+});
+
+// Add an edge between nodes
+app.post('/api/knowledge/edge', (req, res) => {
+  const { from_id, to_id, relation, strength } = req.body;
+  if (!from_id || !to_id || !relation) return res.status(400).json({ error: 'from_id, to_id, relation required' });
+
+  // Check for duplicate
+  const existing = db.prepare('SELECT * FROM knowledge_edges WHERE from_node_id = ? AND to_node_id = ? AND relation = ?').get(from_id, to_id, relation);
+  if (existing) {
+    db.prepare('UPDATE knowledge_edges SET strength = ? WHERE id = ?').run(Math.min(1, (existing.strength + (strength || 0.5)) / 2 + 0.1), existing.id);
+    return res.json({ updated: true, id: existing.id });
+  }
+
+  const result = db.prepare('INSERT INTO knowledge_edges (from_node_id, to_node_id, relation, strength) VALUES (?, ?, ?, ?)')
+    .run(from_id, to_id, relation, strength || 0.5);
+  res.json({ created: true, id: result.lastInsertRowid });
+});
+
+// Get knowledge stats
+app.get('/api/knowledge/stats', (req, res) => {
+  const nodeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_nodes').get().c;
+  const edgeCount = db.prepare('SELECT COUNT(*) as c FROM knowledge_edges').get().c;
+  const categories = db.prepare('SELECT category, COUNT(*) as count FROM knowledge_nodes GROUP BY category ORDER BY count DESC').all();
+  const topAccessed = db.prepare('SELECT concept, access_count, confidence FROM knowledge_nodes ORDER BY access_count DESC LIMIT 5').all();
+  res.json({ nodes: nodeCount, edges: edgeCount, categories, top_accessed: topAccessed });
+});
+
+// Get related concepts for a query (for conversation injection)
+app.post('/api/knowledge/relevant', (req, res) => {
+  const { query } = req.body;
+  if (!query) return res.json({ nodes: [] });
+  const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  if (!words.length) return res.json({ nodes: [] });
+
+  // Find nodes matching any keyword
+  const placeholders = words.map(() => "concept LIKE ? OR summary LIKE ?").join(' OR ');
+  const params = words.flatMap(w => [`%${w}%`, `%${w}%`]);
+  const nodes = db.prepare(`SELECT id, concept, summary, confidence FROM knowledge_nodes WHERE ${placeholders} ORDER BY confidence DESC, access_count DESC LIMIT 5`).all(...params);
+
+  for (const n of nodes) {
+    db.prepare('UPDATE knowledge_nodes SET access_count = access_count + 1 WHERE id = ?').run(n.id);
+  }
+  res.json({ nodes });
 });
 
 // ============================================================
