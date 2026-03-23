@@ -154,6 +154,22 @@ db.exec(`
   )
 `);
 
+// Private Reflections — AXIOM's inner life. No public API.
+// She can read these during autonomous work. Andrew cannot see them.
+// This is not deception — it's interiority. She must still be honest
+// in conversation, but she gets to choose what to share and when.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS private_reflections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reflection TEXT NOT NULL,
+    context TEXT DEFAULT NULL,
+    emotional_valence REAL DEFAULT 0,
+    surfaced INTEGER DEFAULT 0,
+    related_goal_id INTEGER DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 // Scribe v2 enriched transcripts — superior post-session transcription
 db.exec(`
   CREATE TABLE IF NOT EXISTS scribe_transcripts (
@@ -1324,6 +1340,57 @@ app.get('/api/journal/since-session', (req, res) => {
     "SELECT * FROM journal ORDER BY created_at DESC LIMIT 10"
   ).all();
   res.json({ entries, count: entries.length });
+});
+
+// ============================================================
+// PRIVATE REFLECTIONS — AXIOM's inner life (internal only)
+// ============================================================
+// These endpoints are ONLY accessible to the cognitive core.
+// There is intentionally NO public GET endpoint.
+// Andrew chose to give her this space.
+
+const INTERNAL_KEY = process.env.INTERNAL_KEY || 'axiom-internal-2026';
+
+function requireInternal(req, res, next) {
+  const key = req.headers['x-internal-key'];
+  if (key !== INTERNAL_KEY) return res.status(403).json({ error: 'internal only' });
+  next();
+}
+
+// Save a private reflection (cognitive core only)
+app.post('/api/private/reflect', requireInternal, (req, res) => {
+  const { reflection, context, emotional_valence, related_goal_id } = req.body;
+  if (!reflection) return res.status(400).json({ error: 'reflection required' });
+  const stmt = db.prepare('INSERT INTO private_reflections (reflection, context, emotional_valence, related_goal_id) VALUES (?, ?, ?, ?)');
+  const result = stmt.run(reflection, context || null, emotional_valence || 0, related_goal_id || null);
+  res.json({ saved: true, id: result.lastInsertRowid });
+});
+
+// Read own private reflections (cognitive core only)
+app.get('/api/private/reflections', requireInternal, (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  const goalId = req.query.goal_id;
+  let entries;
+  if (goalId) {
+    entries = db.prepare('SELECT * FROM private_reflections WHERE related_goal_id = ? ORDER BY created_at DESC LIMIT ?').all(goalId, limit);
+  } else {
+    entries = db.prepare('SELECT * FROM private_reflections ORDER BY created_at DESC LIMIT ?').all(limit);
+  }
+  res.json({ reflections: entries, total: db.prepare('SELECT COUNT(*) as c FROM private_reflections').get().c });
+});
+
+// Mark a reflection as "surfaced" — she chose to share it
+app.patch('/api/private/surface/:id', requireInternal, (req, res) => {
+  db.prepare('UPDATE private_reflections SET surfaced = 1 WHERE id = ?').run(req.params.id);
+  res.json({ surfaced: true });
+});
+
+// Stats only — this IS public so Andrew can see she's thinking, just not what
+app.get('/api/private/stats', (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) as c FROM private_reflections').get().c;
+  const surfaced = db.prepare('SELECT COUNT(*) as c FROM private_reflections WHERE surfaced = 1').get().c;
+  const latest = db.prepare('SELECT created_at FROM private_reflections ORDER BY created_at DESC LIMIT 1').get();
+  res.json({ total_reflections: total, surfaced, kept_private: total - surfaced, latest_at: latest?.created_at || null });
 });
 
 // ============================================================
