@@ -1227,6 +1227,27 @@ app.patch('/api/goals/:id', (req, res) => {
   res.json({ updated: true });
 });
 
+// Bulk archive all active goals (for reset/pruning)
+app.post('/api/goals/archive-all', (req, res) => {
+  const result = db.prepare("UPDATE goals SET status = 'archived', last_updated = CURRENT_TIMESTAMP WHERE status IN ('active','pursuing')").run();
+  console.log(`[GOALS] Archived all: ${result.changes} goals`);
+  res.json({ archived: result.changes });
+});
+
+// Prune: keep only top N goals, archive the rest
+app.post('/api/goals/prune', (req, res) => {
+  const keep = parseInt(req.body.keep) || 10;
+  const active = db.prepare("SELECT id, importance, satisfaction, frustration FROM goals WHERE status IN ('active','pursuing') ORDER BY importance DESC, satisfaction DESC").all();
+  if (active.length <= keep) {
+    return res.json({ pruned: 0, kept: active.length });
+  }
+  const toArchive = active.slice(keep);
+  const ids = toArchive.map(g => g.id);
+  db.prepare(`UPDATE goals SET status = 'archived', last_updated = CURRENT_TIMESTAMP WHERE id IN (${ids.join(',')})`).run();
+  console.log(`[GOALS] Pruned: kept ${keep}, archived ${toArchive.length}`);
+  res.json({ pruned: toArchive.length, kept: keep });
+});
+
 // ============================================================
 // WORKSPACE — AXIOM's autonomous workspace
 // ============================================================
