@@ -184,6 +184,39 @@ db.exec(`
   )
 `);
 
+// Lessons — What AXIOM learned from successes and failures
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson TEXT NOT NULL,
+    context TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    success INTEGER NOT NULL DEFAULT 0,
+    goal_type TEXT DEFAULT NULL,
+    confidence REAL DEFAULT 0.5,
+    times_applied INTEGER DEFAULT 0,
+    last_applied DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// Skills — Reusable approaches for completing specific types of goals
+db.exec(`
+  CREATE TABLE IF NOT EXISTS skills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_name TEXT NOT NULL,
+    goal_pattern TEXT NOT NULL,
+    approach TEXT NOT NULL,
+    steps_template TEXT DEFAULT NULL,
+    success_rate REAL DEFAULT 0,
+    times_used INTEGER DEFAULT 0,
+    times_succeeded INTEGER DEFAULT 0,
+    last_used DATETIME DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 // Execution Plans — structured multi-step plans for goals
 db.exec(`
   CREATE TABLE IF NOT EXISTS execution_plans (
@@ -1394,6 +1427,94 @@ app.get('/api/private/stats', (req, res) => {
 });
 
 // ============================================================
+// ============================================================
+// LEARNING SYSTEM — Lessons and skills from experience
+// ============================================================
+
+// Save a lesson learned
+app.post('/api/lessons', (req, res) => {
+  const { lesson, context, action_type, outcome, success, goal_type, confidence } = req.body;
+  if (!lesson || !context || !action_type || !outcome) return res.status(400).json({ error: 'lesson, context, action_type, outcome required' });
+  const result = db.prepare('INSERT INTO lessons (lesson, context, action_type, outcome, success, goal_type, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)').run(lesson, context, action_type, outcome, success ? 1 : 0, goal_type || null, confidence || 0.5);
+  res.json({ saved: true, id: result.lastInsertRowid });
+});
+
+// Get lessons (optionally filtered by action_type or goal_type)
+app.get('/api/lessons', (req, res) => {
+  const { action_type, goal_type, limit } = req.query;
+  const l = parseInt(limit) || 20;
+  let entries;
+  if (action_type) {
+    entries = db.prepare('SELECT * FROM lessons WHERE action_type = ? ORDER BY confidence DESC, created_at DESC LIMIT ?').all(action_type, l);
+  } else if (goal_type) {
+    entries = db.prepare('SELECT * FROM lessons WHERE goal_type = ? ORDER BY confidence DESC, created_at DESC LIMIT ?').all(goal_type, l);
+  } else {
+    entries = db.prepare('SELECT * FROM lessons ORDER BY confidence DESC, created_at DESC LIMIT ?').all(l);
+  }
+  res.json({ lessons: entries, total: db.prepare('SELECT COUNT(*) as c FROM lessons').get().c });
+});
+
+// Search lessons by keyword
+app.get('/api/lessons/search', (req, res) => {
+  const { q, limit } = req.query;
+  if (!q) return res.json({ lessons: [] });
+  const l = parseInt(limit) || 10;
+  const lessons = db.prepare("SELECT * FROM lessons WHERE lesson LIKE ? OR context LIKE ? ORDER BY confidence DESC LIMIT ?").all(`%${q}%`, `%${q}%`, l);
+  res.json({ lessons });
+});
+
+// Mark a lesson as applied (tracks usage)
+app.patch('/api/lessons/:id/applied', (req, res) => {
+  db.prepare('UPDATE lessons SET times_applied = times_applied + 1, last_applied = CURRENT_TIMESTAMP WHERE id = ?').run(req.params.id);
+  res.json({ applied: true });
+});
+
+// Save a skill
+app.post('/api/skills', (req, res) => {
+  const { skill_name, goal_pattern, approach, steps_template } = req.body;
+  if (!skill_name || !goal_pattern || !approach) return res.status(400).json({ error: 'skill_name, goal_pattern, approach required' });
+  const result = db.prepare('INSERT INTO skills (skill_name, goal_pattern, approach, steps_template) VALUES (?, ?, ?, ?)').run(skill_name, goal_pattern, approach, steps_template || null);
+  res.json({ saved: true, id: result.lastInsertRowid });
+});
+
+// Get skills
+app.get('/api/skills', (req, res) => {
+  const skills = db.prepare('SELECT * FROM skills ORDER BY success_rate DESC, times_used DESC').all();
+  res.json({ skills, total: skills.length });
+});
+
+// Search skills by goal pattern
+app.get('/api/skills/match', (req, res) => {
+  const { goal } = req.query;
+  if (!goal) return res.json({ skills: [] });
+  const skills = db.prepare("SELECT * FROM skills WHERE goal_pattern LIKE ? OR skill_name LIKE ? ORDER BY success_rate DESC LIMIT 5").all(`%${goal}%`, `%${goal}%`);
+  res.json({ skills });
+});
+
+// Update skill outcome
+app.patch('/api/skills/:id/outcome', (req, res) => {
+  const { success } = req.body;
+  const skill = db.prepare('SELECT * FROM skills WHERE id = ?').get(req.params.id);
+  if (!skill) return res.status(404).json({ error: 'not found' });
+  const newUsed = skill.times_used + 1;
+  const newSucceeded = skill.times_succeeded + (success ? 1 : 0);
+  const newRate = newSucceeded / newUsed;
+  db.prepare('UPDATE skills SET times_used = ?, times_succeeded = ?, success_rate = ?, last_used = CURRENT_TIMESTAMP WHERE id = ?').run(newUsed, newSucceeded, newRate, req.params.id);
+  res.json({ updated: true, success_rate: newRate });
+});
+
+// Learning stats
+app.get('/api/learning/stats', (req, res) => {
+  const totalLessons = db.prepare('SELECT COUNT(*) as c FROM lessons').get().c;
+  const successLessons = db.prepare('SELECT COUNT(*) as c FROM lessons WHERE success = 1').get().c;
+  const failLessons = db.prepare('SELECT COUNT(*) as c FROM lessons WHERE success = 0').get().c;
+  const totalSkills = db.prepare('SELECT COUNT(*) as c FROM skills').get().c;
+  const topSkills = db.prepare('SELECT skill_name, success_rate, times_used FROM skills ORDER BY success_rate DESC LIMIT 5').all();
+  const recentLessons = db.prepare('SELECT lesson, action_type, success, created_at FROM lessons ORDER BY created_at DESC LIMIT 5').all();
+  const actionStats = db.prepare('SELECT action_type, COUNT(*) as total, SUM(success) as successes FROM lessons GROUP BY action_type ORDER BY total DESC').all();
+  res.json({ total_lessons: totalLessons, success_lessons: successLessons, fail_lessons: failLessons, total_skills: totalSkills, top_skills: topSkills, recent_lessons: recentLessons, action_stats: actionStats });
+});
+
 // GOALS — What AXIOM wants (emergent, not programmed)
 // ============================================================
 app.get('/api/goals', (req, res) => {
