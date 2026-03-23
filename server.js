@@ -57,8 +57,8 @@ app.use((req, res, next) => {
 // HEALTH/HEARTBEAT ENDPOINT with cognitive metrics
 app.get('/health', (req, res) => {
   try {
-    const knowledgeNodeCount = db.prepare('SELECT COUNT(*) as count FROM memories').get().count;
-    const activeProposalCount = db.prepare("SELECT COUNT(*) as count FROM goals WHERE status='active'").get().count;
+    const knowledgeNodeCount = db.prepare('SELECT COUNT(*) as count FROM knowledge_nodes').get().count;
+    const activeProposalCount = db.prepare("SELECT COUNT(*) as count FROM code_proposals WHERE status='active'").get().count;
     
     res.json({
       status: 'ok',
