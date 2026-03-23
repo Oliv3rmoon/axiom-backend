@@ -54,6 +54,34 @@ app.use((req, res, next) => {
   next();
 });
 
+// HEALTH/HEARTBEAT ENDPOINT with cognitive metrics
+app.get('/health', (req, res) => {
+  try {
+    const knowledgeNodeCount = db.prepare('SELECT COUNT(*) as count FROM memories').get().count;
+    const activeProposalCount = db.prepare("SELECT COUNT(*) as count FROM goals WHERE status='active'").get().count;
+    
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      health: {
+        knowledge_nodes: knowledgeNodeCount,
+        active_proposals: activeProposalCount
+      },
+      services: {
+        database: 'connected',
+        face_service: FACE_SERVICE_URL ? 'configured' : 'not_configured',
+        voice_service: VOICE_SERVICE_URL ? 'configured' : 'not_configured',
+        cognitive_core: COGNITIVE_CORE_URL ? 'configured' : 'not_configured'
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
 // DATABASE SETUP — use persistent volume if available
 const DB_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
 if (DB_DIR !== '.' && !existsSync(DB_DIR)) { mkdirSync(DB_DIR, { recursive: true }); }
