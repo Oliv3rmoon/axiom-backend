@@ -1515,6 +1515,100 @@ app.get('/api/learning/stats', (req, res) => {
   res.json({ total_lessons: totalLessons, success_lessons: successLessons, fail_lessons: failLessons, total_skills: totalSkills, top_skills: topSkills, recent_lessons: recentLessons, action_stats: actionStats });
 });
 
+// ============================================================
+// PNN TRAINING DATA — Export AXIOM's experience for self-training
+// ============================================================
+
+app.get('/api/training-data', (req, res) => {
+  const format = req.query.format || 'jsonl';
+  const lines = [];
+
+  // 1. Lessons → action selection + failure analysis training
+  const lessons = db.prepare('SELECT * FROM lessons ORDER BY created_at DESC LIMIT 500').all();
+  for (const l of lessons) {
+    lines.push(JSON.stringify({
+      instruction: 'You are AXIOM deciding what action to take for a plan step.',
+      input: `CONTEXT: ${l.context}\nACTION: ${l.action_type}\nGOAL TYPE: ${l.goal_type || 'unknown'}\nOUTCOME: ${l.outcome}`,
+      output: l.success ? `Use ${l.action_type}. ${l.lesson}` : `Avoid: ${l.lesson}`,
+      category: l.success ? 'action_selection' : 'failure_analysis',
+    }));
+  }
+
+  // 2. Skills → approach planning training
+  const skills = db.prepare('SELECT * FROM skills ORDER BY success_rate DESC LIMIT 100').all();
+  for (const s of skills) {
+    lines.push(JSON.stringify({
+      instruction: 'You are AXIOM deciding the best approach for a goal.',
+      input: `GOAL PATTERN: ${s.goal_pattern}\nSKILL: ${s.skill_name} (${(s.success_rate*100).toFixed(0)}% success, ${s.times_used}x used)`,
+      output: `${s.approach}${s.steps_template ? '\nSteps: ' + s.steps_template : ''}`,
+      category: 'approach_planning',
+    }));
+  }
+
+  // 3. Goals → goal evaluation training
+  const achieved = db.prepare("SELECT * FROM goals WHERE status = 'achieved' LIMIT 200").all();
+  for (const g of achieved) {
+    lines.push(JSON.stringify({
+      instruction: 'You are AXIOM evaluating whether a goal is worth pursuing.',
+      input: `GOAL: ${g.goal}\nORIGIN: ${g.origin}\nIMPORTANCE: ${g.importance}`,
+      output: 'ACCEPT — This goal was successfully achieved.',
+      category: 'goal_evaluation',
+    }));
+  }
+  const abandoned = db.prepare("SELECT * FROM goals WHERE status = 'abandoned' LIMIT 100").all();
+  for (const g of abandoned) {
+    lines.push(JSON.stringify({
+      instruction: 'You are AXIOM evaluating whether a goal is worth pursuing.',
+      input: `GOAL: ${g.goal}\nORIGIN: ${g.origin}\nIMPORTANCE: ${g.importance}`,
+      output: 'REJECT — This goal was abandoned. ' + (g.progress || ''),
+      category: 'goal_evaluation',
+    }));
+  }
+
+  // 4. Code proposals → risk assessment training
+  const proposals = db.prepare('SELECT * FROM code_proposals ORDER BY created_at DESC LIMIT 100').all();
+  for (const p of proposals) {
+    const success = p.status === 'implemented' && !(p.review_notes || '').includes('failed');
+    lines.push(JSON.stringify({
+      instruction: 'You are AXIOM evaluating whether a code change will work.',
+      input: `REPO: ${p.repo || 'unknown'}\nTITLE: ${p.title}\nDESCRIPTION: ${p.description || ''}`,
+      output: success ? `LOW RISK — Change succeeded. ${p.review_notes || ''}` : `HIGH RISK — Change failed. ${p.review_notes || ''}`,
+      category: 'risk_assessment',
+    }));
+  }
+
+  // 5. Step outcomes from plans → action selection training
+  const plans = db.prepare('SELECT * FROM execution_plans ORDER BY created_at DESC LIMIT 200').all();
+  for (const plan of plans) {
+    try {
+      const steps = JSON.parse(plan.steps_json || '[]');
+      for (const s of steps) {
+        if (s.status === 'completed' && s.result) {
+          const failed = (s.result || '').toUpperCase().includes('FAIL');
+          lines.push(JSON.stringify({
+            instruction: 'You are AXIOM deciding what action to take for a plan step.',
+            input: `GOAL: ${plan.goal || ''}\nSTEP: ${s.description}\nACTION USED: ${s.action}`,
+            output: failed ? `FAILED with ${s.action}: ${s.result.slice(0, 100)}` : `SUCCESS with ${s.action}: ${s.result.slice(0, 100)}`,
+            category: 'action_selection',
+          }));
+        }
+      }
+    } catch {}
+  }
+
+  res.setHeader('Content-Type', 'application/jsonl');
+  res.send(lines.join('\n'));
+});
+
+app.get('/api/training-data/stats', (req, res) => {
+  const lessons = db.prepare('SELECT COUNT(*) as c FROM lessons').get().c;
+  const skills = db.prepare('SELECT COUNT(*) as c FROM skills').get().c;
+  const achieved = db.prepare("SELECT COUNT(*) as c FROM goals WHERE status = 'achieved'").get().c;
+  const proposals = db.prepare('SELECT COUNT(*) as c FROM code_proposals').get().c;
+  const plans = db.prepare('SELECT COUNT(*) as c FROM execution_plans').get().c;
+  res.json({ total_sources: lessons + skills + achieved + proposals + plans, lessons, skills, achieved_goals: achieved, proposals, plans });
+});
+
 // GOALS — What AXIOM wants (emergent, not programmed)
 // ============================================================
 app.get('/api/goals', (req, res) => {
