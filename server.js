@@ -454,6 +454,35 @@ db.exec(`
 `);
 const insertRawEvent = db.prepare(`INSERT INTO raw_events (path, body) VALUES (?, ?)`);
 
+// Conversation logging — every word said during live sessions
+db.exec(`
+  CREATE TABLE IF NOT EXISTS conversation_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    emotion TEXT,
+    momentum TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation_turns(session_id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_time ON conversation_turns(created_at)`);
+
+// Commitments — promises AXIOM made during conversations
+db.exec(`
+  CREATE TABLE IF NOT EXISTS commitments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    promise TEXT NOT NULL,
+    context TEXT,
+    session_id TEXT,
+    status TEXT DEFAULT 'open',
+    goal_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+  )
+`);
+
 // TOOL HANDLERS
 const toolHandlers = {
   save_memory: (args, cid) => {
@@ -2110,6 +2139,83 @@ app.post('*', (req, res) => {
   console.log(JSON.stringify(req.body).slice(0, 1000));
   try { insertRawEvent.run(req.path, JSON.stringify(req.body)); } catch(e) {}
   res.json({ acknowledged: true });
+});
+
+// ============================================================
+// CONVERSATION LOGGING — Every word from live sessions
+// ============================================================
+
+// Save a conversation turn
+app.post('/api/conversations', (req, res) => {
+  const { session_id, role, content, emotion, momentum } = req.body;
+  if (!session_id || !role || !content) return res.status(400).json({ error: 'session_id, role, content required' });
+  try {
+    db.prepare('INSERT INTO conversation_turns (session_id, role, content, emotion, momentum) VALUES (?, ?, ?, ?, ?)').run(
+      session_id, role, content.slice(0, 10000), emotion || null, momentum ? JSON.stringify(momentum) : null
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get conversation by session
+app.get('/api/conversations/:session_id', (req, res) => {
+  const turns = db.prepare('SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at ASC').all(req.params.session_id);
+  res.json({ session_id: req.params.session_id, turns, count: turns.length });
+});
+
+// Get latest conversation
+app.get('/api/conversations/latest/session', (req, res) => {
+  const latest = db.prepare('SELECT DISTINCT session_id, MAX(created_at) as last_turn FROM conversation_turns GROUP BY session_id ORDER BY last_turn DESC LIMIT 1').get();
+  if (!latest) return res.json({ session_id: null, turns: [], count: 0 });
+  const turns = db.prepare('SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at ASC').all(latest.session_id);
+  res.json({ session_id: latest.session_id, turns, count: turns.length });
+});
+
+// List all sessions
+app.get('/api/conversations', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const sessions = db.prepare(`
+    SELECT session_id, COUNT(*) as turn_count, MIN(created_at) as started, MAX(created_at) as ended
+    FROM conversation_turns GROUP BY session_id ORDER BY ended DESC LIMIT ?
+  `).all(limit);
+  res.json({ sessions, count: sessions.length });
+});
+
+// Search conversations for specific content
+app.get('/api/conversations/search/:query', (req, res) => {
+  const query = `%${req.params.query}%`;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const results = db.prepare('SELECT * FROM conversation_turns WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?').all(query, limit);
+  res.json({ results, count: results.length, query: req.params.query });
+});
+
+// ============================================================
+// COMMITMENTS — Promises AXIOM made
+// ============================================================
+
+// Add a commitment
+app.post('/api/commitments', (req, res) => {
+  const { promise, context, session_id } = req.body;
+  if (!promise) return res.status(400).json({ error: 'promise required' });
+  try {
+    const result = db.prepare('INSERT INTO commitments (promise, context, session_id) VALUES (?, ?, ?)').run(
+      promise, context || null, session_id || null
+    );
+    res.json({ id: result.lastInsertRowid, promise });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get open commitments
+app.get('/api/commitments', (req, res) => {
+  const status = req.query.status || 'open';
+  const commitments = db.prepare('SELECT * FROM commitments WHERE status = ? ORDER BY created_at DESC').all(status);
+  res.json({ commitments, count: commitments.length });
+});
+
+// Complete a commitment
+app.post('/api/commitments/:id/complete', (req, res) => {
+  db.prepare('UPDATE commitments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?').run('completed', req.params.id);
+  res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3000;
