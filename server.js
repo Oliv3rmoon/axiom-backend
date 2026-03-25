@@ -2133,19 +2133,10 @@ app.get('/api/raw-events', (req, res) => { res.json({ events: db.prepare('SELECT
 
 
 
-// CATCH-ALL for any other POST
-app.post('*', (req, res) => {
-  console.log(`\n[CATCH-ALL] POST to ${req.path}`);
-  console.log(JSON.stringify(req.body).slice(0, 1000));
-  try { insertRawEvent.run(req.path, JSON.stringify(req.body)); } catch(e) {}
-  res.json({ acknowledged: true });
-});
-
 // ============================================================
 // CONVERSATION LOGGING — Every word from live sessions
 // ============================================================
 
-// Save a conversation turn
 app.post('/api/conversations', (req, res) => {
   const { session_id, role, content, emotion, momentum } = req.body;
   if (!session_id || !role || !content) return res.status(400).json({ error: 'session_id, role, content required' });
@@ -2157,13 +2148,6 @@ app.post('/api/conversations', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get conversation by session
-app.get('/api/conversations/:session_id', (req, res) => {
-  const turns = db.prepare('SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at ASC').all(req.params.session_id);
-  res.json({ session_id: req.params.session_id, turns, count: turns.length });
-});
-
-// Get latest conversation
 app.get('/api/conversations/latest/session', (req, res) => {
   const latest = db.prepare('SELECT DISTINCT session_id, MAX(created_at) as last_turn FROM conversation_turns GROUP BY session_id ORDER BY last_turn DESC LIMIT 1').get();
   if (!latest) return res.json({ session_id: null, turns: [], count: 0 });
@@ -2171,7 +2155,18 @@ app.get('/api/conversations/latest/session', (req, res) => {
   res.json({ session_id: latest.session_id, turns, count: turns.length });
 });
 
-// List all sessions
+app.get('/api/conversations/search/:query', (req, res) => {
+  const query = `%${req.params.query}%`;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const results = db.prepare('SELECT * FROM conversation_turns WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?').all(query, limit);
+  res.json({ results, count: results.length, query: req.params.query });
+});
+
+app.get('/api/conversations/:session_id', (req, res) => {
+  const turns = db.prepare('SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at ASC').all(req.params.session_id);
+  res.json({ session_id: req.params.session_id, turns, count: turns.length });
+});
+
 app.get('/api/conversations', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 20, 100);
   const sessions = db.prepare(`
@@ -2181,19 +2176,10 @@ app.get('/api/conversations', (req, res) => {
   res.json({ sessions, count: sessions.length });
 });
 
-// Search conversations for specific content
-app.get('/api/conversations/search/:query', (req, res) => {
-  const query = `%${req.params.query}%`;
-  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-  const results = db.prepare('SELECT * FROM conversation_turns WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?').all(query, limit);
-  res.json({ results, count: results.length, query: req.params.query });
-});
-
 // ============================================================
 // COMMITMENTS — Promises AXIOM made
 // ============================================================
 
-// Add a commitment
 app.post('/api/commitments', (req, res) => {
   const { promise, context, session_id } = req.body;
   if (!promise) return res.status(400).json({ error: 'promise required' });
@@ -2205,17 +2191,23 @@ app.post('/api/commitments', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get open commitments
 app.get('/api/commitments', (req, res) => {
   const status = req.query.status || 'open';
   const commitments = db.prepare('SELECT * FROM commitments WHERE status = ? ORDER BY created_at DESC').all(status);
   res.json({ commitments, count: commitments.length });
 });
 
-// Complete a commitment
 app.post('/api/commitments/:id/complete', (req, res) => {
   db.prepare('UPDATE commitments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?').run('completed', req.params.id);
   res.json({ success: true });
+});
+
+// CATCH-ALL for any other POST
+app.post('*', (req, res) => {
+  console.log(`\n[CATCH-ALL] POST to ${req.path}`);
+  console.log(JSON.stringify(req.body).slice(0, 1000));
+  try { insertRawEvent.run(req.path, JSON.stringify(req.body)); } catch(e) {}
+  res.json({ acknowledged: true });
 });
 
 const PORT = process.env.PORT || 3000;
