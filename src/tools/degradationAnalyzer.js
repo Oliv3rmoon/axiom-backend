@@ -1,5 +1,11 @@
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const fs = require('fs').promises;
-const path = require('path');
+
 
 /**
  * Degradation Analyzer
@@ -176,3 +182,29 @@ class DegradationAnalyzer {
       
       if (!this.metrics.responseQualityByDepth[depth]) {
         this.metrics
+        this.metrics.responseQualityByDepth[depth] = [];
+      }
+      this.metrics.responseQualityByDepth[depth].push(qualityScore);
+    }
+
+    return pattern;
+  }
+
+  assessWindowQuality(window) {
+    if (!window || !window.length) return 0;
+    const avgLength = window.reduce((sum, r) => sum + (r.length || 0), 0) / window.length;
+    const hasErrors = window.some(r => r.error);
+    return hasErrors ? 0.3 : Math.min(1, avgLength / 500);
+  }
+
+  getReport() {
+    return {
+      totalAnalyzed: this.metrics.totalAnalyzed || 0,
+      degradationEvents: this.metrics.degradationEvents || [],
+      responseQualityByDepth: this.metrics.responseQualityByDepth || {},
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+export default DegradationAnalyzer;

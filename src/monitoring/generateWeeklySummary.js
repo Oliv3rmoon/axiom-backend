@@ -1,6 +1,10 @@
-const fs = require('fs').promises;
-const path = require('path');
-const { execSync } = require('child_process');
+import fs from 'fs/promises';
+import path from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const WORKSPACE_PATH = process.env.AXIOM_WORKSPACE_PATH || path.join(__dirname, '../../axiom-workspace');
 const LOGS_PATH = path.join(WORKSPACE_PATH, 'logs');
@@ -150,4 +154,31 @@ class WeeklySummaryGenerator {
       : 0;
 
     return {
-      total
+      totalConversations,
+      totalMessages,
+      averageMessages,
+      weekStart: this.weekStart.toISOString(),
+      weekEnd: this.weekEnd.toISOString(),
+      generatedAt: new Date().toISOString()
+    };
+  }
+
+  async generateSummary() {
+    await this.loadConversationLogs();
+    const stats = this.calculateStats();
+    
+    const summaryPath = path.join(SUMMARIES_PATH, `week-${this.weekStart.toISOString().split('T')[0]}.json`);
+    
+    try {
+      await fs.mkdir(SUMMARIES_PATH, { recursive: true });
+      await fs.writeFile(summaryPath, JSON.stringify(stats, null, 2));
+      console.log(`[WeeklySummary] Generated: ${summaryPath}`);
+    } catch (error) {
+      console.error('[WeeklySummary] Failed to write summary:', error);
+    }
+    
+    return stats;
+  }
+}
+
+export default WeeklySummaryGenerator;

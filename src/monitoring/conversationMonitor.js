@@ -1,6 +1,10 @@
-const fs = require('fs').promises;
-const path = require('path');
-const crypto = require('crypto');
+import fs from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 class ConversationMonitor {
   constructor(config = {}) {
@@ -181,3 +185,31 @@ class ConversationMonitor {
     this.activeConversations.delete(conversationId);
 
     this.
+    this.saveMetrics();
+    
+    return sessionSummary;
+  }
+
+  async saveMetrics() {
+    try {
+      await fs.writeFile(this.currentLogFile, JSON.stringify(this.metrics, null, 2));
+    } catch (error) {
+      console.error('[ConversationMonitor] Failed to save metrics:', error);
+    }
+  }
+
+  getDateString() {
+    return new Date().toISOString().split('T')[0];
+  }
+
+  getMetrics() {
+    return {
+      totalResponses: this.metrics.responses.length,
+      totalToolCalls: this.metrics.toolCalls.length,
+      totalSessions: this.metrics.sessions.length,
+      activeConversations: this.activeConversations.size
+    };
+  }
+}
+
+export default ConversationMonitor;
