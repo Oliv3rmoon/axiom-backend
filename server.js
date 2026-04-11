@@ -54,6 +54,23 @@ app.use((req, res, next) => {
   next();
 });
 
+// Confidence-based response bypass - allows direct responses when AXIOM is certain
+function shouldBypassTools(userMessage, context) {
+  // Skip tool routing for simple conversational queries
+  const directResponsePatterns = [
+    /^(hi|hey|hello|good morning|good evening)/i,
+    /^how are you/i,
+    /^what('s| is) (your name|up)/i,
+    /^(thanks|thank you|okay|ok|got it)/i
+  ];
+  
+  if (directResponsePatterns.some(pattern => pattern.test(userMessage.trim()))) {
+    return { bypass: true, confidence: 0.95, reason: 'simple_greeting' };
+  }
+  
+  return { bypass: false, confidence: 0, reason: 'requires_tools' };
+}
+
 // HEALTH/HEARTBEAT ENDPOINT with cognitive metrics
 app.get('/health', (req, res) => {
   try {
