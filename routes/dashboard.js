@@ -125,4 +125,53 @@ router.get('/', authenticateToken, async (req, res) => {
         FROM knowledge_nodes 
         WHERE user_id = $1 
         ORDER BY created_at DESC 
-        LIMIT
+        LIMIT 5`,
+        [userId]
+      ),
+
+      // Recent journal entries (last 5)
+      db.query(
+        `SELECT id, title, content, mood, tags, created_at
+        FROM journal_entries 
+        WHERE user_id = $1 
+        ORDER BY created_at DESC 
+        LIMIT 5`,
+        [userId]
+      ),
+
+      // Recent proposals (last 5)
+      db.query(
+        `SELECT id, title, description, status, priority, created_at, updated_at
+        FROM proposals 
+        WHERE user_id = $1 
+        ORDER BY created_at DESC 
+        LIMIT 5`,
+        [userId]
+      ),
+    ]);
+
+    res.json({
+      statistics: {
+        plans: plansResult.rows[0] || {},
+        goals: goalsResult.rows[0] || {},
+        knowledgeNodes: knowledgeNodesResult.rows[0] || {},
+        wallet: walletResult.rows[0] || {},
+        journal: journalResult.rows[0] || {},
+        proposals: proposalsResult.rows[0] || {},
+      },
+      recent: {
+        plans: recentPlansResult.rows || [],
+        goals: recentGoalsResult.rows || [],
+        knowledgeNodes: recentKnowledgeResult.rows || [],
+        journal: recentJournalResult.rows || [],
+        proposals: recentProposalsResult.rows || [],
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Dashboard error:', error.message);
+    res.status(500).json({ error: 'Failed to load dashboard data' });
+  }
+});
+
+module.exports = router;
