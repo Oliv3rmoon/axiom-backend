@@ -1408,7 +1408,10 @@ app.post('/api/journal', (req, res) => {
 
 app.get('/api/journal', (req, res) => {
   const limit = parseInt(req.query.limit) || 20;
-  const entries = db.prepare('SELECT * FROM journal ORDER BY created_at DESC LIMIT ?').all(limit);
+  const triggerType = req.query.trigger_type;
+  const entries = triggerType
+    ? db.prepare('SELECT * FROM journal WHERE trigger_type = ? ORDER BY created_at DESC LIMIT ?').all(triggerType, limit)
+    : db.prepare('SELECT * FROM journal ORDER BY created_at DESC LIMIT ?').all(limit);
   res.json({ entries, total: db.prepare('SELECT COUNT(*) as c FROM journal').get().c });
 });
 
