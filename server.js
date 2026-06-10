@@ -984,6 +984,13 @@ app.post('/api/create-conversation', async (req, res) => {
 // API ENDPOINTS
 app.get('/api/memories', (req, res) => { res.json({ memories: getAllMemories.all('andrew') }); });
 
+// PHASE 1 (memory lab) — full corpus export. READ-ONLY, token-gated. Remove after migration.
+app.get('/api/memories/export-all', (req, res) => {
+  if (!process.env.EXPORT_TOKEN || req.query.token !== process.env.EXPORT_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const rows = db.prepare('SELECT id, user_id, memory, category, importance, tier, session_number, created_at FROM memories ORDER BY id').all();
+  res.json({ count: rows.length, memories: rows });
+});
+
 // Direct memory save endpoint — used by Cognitive Core's memory extraction system
 app.post('/api/memories', (req, res) => {
   const { memory, category, importance, user_id } = req.body;
