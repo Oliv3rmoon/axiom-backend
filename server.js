@@ -455,6 +455,36 @@ console.log('Database initialized.');
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 // Brain processing moved to Cognitive Core
 
+// ---- Phase 1 (AXIOM 2.0): memory vector embedding ----
+// Fire-and-forget by design: a failed embed leaves the row unembedded and
+// retrieval falls back to TF-IDF for it. MUST never throw into the write path.
+const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || process.env.LITELLM_MASTER_KEY || 'sk-axiom-2026';
+const EMBED_MODEL_NAME = 'titan-embed';
+const upsertVector = db.prepare('INSERT OR REPLACE INTO memory_vectors (memory_id, vec, model, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)');
+
+async function embedText(text) {
+  const r = await fetch(`${LLM_PROXY_URL}/v1/embeddings`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: EMBED_MODEL_NAME, input: String(text).slice(0, 8000) }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!r.ok) throw new Error(`embed HTTP ${r.status}`);
+  const d = await r.json();
+  const v = d?.data?.[0]?.embedding;
+  if (!Array.isArray(v) || v.length < 8) throw new Error('embed: bad vector shape');
+  return v;
+}
+
+function embedMemoryVector(memoryId, text) {
+  try {
+    if (!memoryId || !text) return;
+    embedText(text)
+      .then(v => upsertVector.run(memoryId, Buffer.from(new Float32Array(v).buffer), EMBED_MODEL_NAME))
+      .catch(e => console.error(`[memory] embed-on-write failed for #${memoryId}: ${e.message}`));
+  } catch (e) { console.error(`[memory] embed-on-write sync error: ${e.message}`); }
+}
+
 // EMOTION VALENCE SCORING — maps emotions to positive/negative values
 function getEmotionValence(emotion) {
   const map = {
@@ -520,7 +550,8 @@ const toolHandlers = {
   save_memory: (args, cid) => {
     const { memory, category, importance } = args;
     const session = getSessionNumber();
-    insertMemory.run('andrew', cid, memory, category, importance, session);
+    const _mvIns = insertMemory.run('andrew', cid, memory, category, importance, session);
+    embedMemoryVector(_mvIns.lastInsertRowid, memory);
     console.log(`[MEMORY SAVED] (${category}, imp:${importance}, session:${session}): ${memory.slice(0, 80)}`);
     // Auto-promote high importance to core tier
     if (importance >= 9) {
@@ -1006,12 +1037,36 @@ app.get('/api/memories/export-all', (req, res) => {
   res.json({ count: rows.length, memories: rows });
 });
 
+// Phase 1 step 3: token-gated, chunked, idempotent vector backfill.
+// Only embeds non-archived rows missing a vector; call repeatedly until remaining = 0.
+app.post('/api/memories/backfill-vectors', async (req, res) => {
+  if (!process.env.EXPORT_TOKEN || req.query.token !== process.env.EXPORT_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const limit = Math.min(parseInt(req.query.limit) || 40, 100);
+  const pending = db.prepare(`
+    SELECT m.id, m.memory FROM memories m
+    LEFT JOIN memory_vectors v ON v.memory_id = m.id
+    WHERE m.tier != 'archived' AND v.memory_id IS NULL
+    ORDER BY m.id LIMIT ?`).all(limit);
+  let embedded = 0; const errors = [];
+  for (const row of pending) {
+    try {
+      const v = await embedText(row.memory);
+      upsertVector.run(row.id, Buffer.from(new Float32Array(v).buffer), EMBED_MODEL_NAME);
+      embedded++;
+    } catch (e) { errors.push({ id: row.id, error: e.message }); }
+  }
+  const remaining = db.prepare(`SELECT COUNT(*) AS c FROM memories m LEFT JOIN memory_vectors v ON v.memory_id = m.id WHERE m.tier != 'archived' AND v.memory_id IS NULL`).get().c;
+  const vectors = db.prepare('SELECT COUNT(*) AS c FROM memory_vectors').get().c;
+  res.json({ embedded, errors, vectors, remaining });
+});
+
 // Direct memory save endpoint — used by Cognitive Core's memory extraction system
 app.post('/api/memories', (req, res) => {
   const { memory, category, importance, user_id } = req.body;
   if (!memory) return res.status(400).json({ error: 'memory required' });
   const session = getSessionNumber();
-  insertMemory.run(user_id || 'andrew', 'core-extract', memory, category || 'personal_detail', importance || 5, session);
+  const _mvIns = insertMemory.run(user_id || 'andrew', 'core-extract', memory, category || 'personal_detail', importance || 5, session);
+  embedMemoryVector(_mvIns.lastInsertRowid, memory);
   if (importance >= 9) {
     const lastId = db.prepare('SELECT last_insert_rowid() as id').get().id;
     db.prepare("UPDATE memories SET tier = 'core' WHERE id = ?").run(lastId);
@@ -1235,7 +1290,8 @@ app.get('/api/memories/stats', (req, res) => {
     archived: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew' AND tier = 'archived'").get().c,
     total: db.prepare("SELECT COUNT(*) as c FROM memories WHERE user_id = 'andrew'").get().c,
   };
-  res.json({ session, tiers });
+  const vectors = db.prepare('SELECT COUNT(*) AS c FROM memory_vectors').get().c;
+  res.json({ session, tiers, vectors });
 });
 
 // Bootstrap: set session counter based on existing data + promote core memories
@@ -1366,9 +1422,10 @@ Rules:
 
         for (const cm of consolidated) {
           // Insert consolidated memory
-          db.prepare(
+          const _mvIns = db.prepare(
             "INSERT INTO memories (user_id, memory, category, importance, tier, consolidated_from, session_number) VALUES (?, ?, ?, ?, 'long_term', ?, ?)"
           ).run('andrew', cm.memory, category, cm.importance || 8, sourceIds.join(','), currentSession);
+          embedMemoryVector(_mvIns.lastInsertRowid, cm.memory);
 
           console.log(`[CONSOLIDATION] Created: [${category}] ${cm.memory.slice(0, 80)}`);
         }
