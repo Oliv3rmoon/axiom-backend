@@ -1131,6 +1131,29 @@ app.post('/api/memories/eval-retrieval', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Item 8: vector-powered near-duplicate report (read-only; exposure <= existing /api/memories)
+app.get('/api/memories/duplicates', (req, res) => {
+  try {
+    const threshold = Math.min(Math.max(parseFloat(req.query.threshold) || 0.95, 0.85), 0.999);
+    const rows = db.prepare(`SELECT m.id, m.memory, m.tier, v.vec FROM memories m
+      JOIN memory_vectors v ON v.memory_id = m.id WHERE m.tier != 'archived'`).all();
+    const vecs = rows.map(r => ({ id: r.id, tier: r.tier, memory: r.memory, v: new Float32Array(r.vec.buffer, r.vec.byteOffset, r.vec.byteLength / 4) }));
+    const pairs = [];
+    for (let i = 0; i < vecs.length; i++) {
+      for (let j = i + 1; j < vecs.length; j++) {
+        let d=0,na=0,nb=0; const a=vecs[i].v, b=vecs[j].v;
+        for (let k=0;k<a.length;k++){d+=a[k]*b[k];na+=a[k]*a[k];nb+=b[k]*b[k];}
+        const sim = (na&&nb)? d/(Math.sqrt(na)*Math.sqrt(nb)) : 0;
+        if (sim >= threshold) pairs.push({ a: vecs[i].id, b: vecs[j].id, sim: +sim.toFixed(4),
+          tierA: vecs[i].tier, tierB: vecs[j].tier,
+          memA: vecs[i].memory.slice(0,100), memB: vecs[j].memory.slice(0,100) });
+      }
+    }
+    pairs.sort((x,y)=>y.sim-x.sim);
+    res.json({ threshold, scanned: vecs.length, found: pairs.length, pairs: pairs.slice(0,20) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Direct memory save endpoint — used by Cognitive Core's memory extraction system
 app.post('/api/memories', (req, res) => {
   const { memory, category, importance, user_id } = req.body;
@@ -1355,6 +1378,15 @@ app.post('/api/memories/context', async (req, res) => {
     context += '\n\nRELEVANT TO NOW:\n';
     context += r.relevant.map(m => `• [${m.category}] ${m.memory}`).join('\n');
   }
+  // Item 8: lessons consumer — OFF until LESSONS_IN_CONTEXT=1 (eval-gated)
+  if (['1','true','on'].includes(String(process.env.LESSONS_IN_CONTEXT||'').toLowerCase())) {
+    try {
+      const topLessons = db.prepare('SELECT lesson FROM lessons ORDER BY confidence DESC, created_at DESC LIMIT 3').all();
+      if (topLessons.length > 0) {
+        context += '\n\nLESSONS (from experience):\n' + topLessons.map(l => `\u2022 ${l.lesson}`).join('\n');
+      }
+    } catch (e) { console.error('[memory] lessons inject failed:', e.message); }
+  }
   const remaining = r.total - r.core.length - r.long_term.length - r.short_term.length - r.relevant.length;
   if (remaining > 0) {
     context += `\n\n[${remaining} other memories stored — use recall_memory tool to search for specific ones]`;
@@ -1556,6 +1588,14 @@ Rules:
 app.get('/api/internal-states', (req, res) => { res.json({ states: db.prepare('SELECT * FROM internal_states ORDER BY created_at DESC LIMIT 50').all() }); });
 app.get('/api/perceptions', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log ORDER BY created_at DESC LIMIT 100').all() }); });
 app.get('/api/perceptions/:id', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log WHERE conversation_id = ? ORDER BY created_at ASC').all(req.params.id) }); });
+// Item 8: most recent conversation's transcript (for sleep-time lesson extraction)
+app.get('/api/transcripts/latest', (req, res) => {
+  const last = db.prepare('SELECT conversation_id FROM transcripts ORDER BY created_at DESC LIMIT 1').get();
+  if (!last) return res.json({ conversation_id: null, transcript: [] });
+  const rows = db.prepare('SELECT role, content, created_at FROM transcripts WHERE conversation_id = ? ORDER BY created_at ASC').all(last.conversation_id);
+  res.json({ conversation_id: last.conversation_id, turns: rows.length, transcript: rows });
+});
+
 app.get('/api/transcripts/:id', (req, res) => { res.json({ transcript: db.prepare('SELECT * FROM transcripts WHERE conversation_id = ? ORDER BY created_at ASC').all(req.params.id) }); });
 app.get('/api/emotional-arc/:id', (req, res) => {
   const p = db.prepare("SELECT tool_name, data, created_at FROM perception_log WHERE conversation_id = ? AND tool_name IN ('emotional_state','voice_emotion','energy_shift') ORDER BY created_at ASC").all(req.params.id);
