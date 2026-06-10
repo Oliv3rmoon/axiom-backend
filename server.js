@@ -1381,7 +1381,7 @@ app.post('/api/memories/context', async (req, res) => {
   // Item 8: lessons consumer — OFF until LESSONS_IN_CONTEXT=1 (eval-gated)
   if (['1','true','on'].includes(String(process.env.LESSONS_IN_CONTEXT||'').toLowerCase())) {
     try {
-      const topLessons = db.prepare('SELECT lesson FROM lessons ORDER BY confidence DESC, created_at DESC LIMIT 3').all();
+      const topLessons = db.prepare("SELECT lesson FROM lessons WHERE action_type = 'conversation' ORDER BY confidence DESC, created_at DESC LIMIT 3").all();
       if (topLessons.length > 0) {
         context += '\n\nLESSONS (from experience):\n' + topLessons.map(l => `\u2022 ${l.lesson}`).join('\n');
       }
