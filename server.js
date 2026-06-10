@@ -485,6 +485,34 @@ function embedMemoryVector(memoryId, text) {
   } catch (e) { console.error(`[memory] embed-on-write sync error: ${e.message}`); }
 }
 
+// ---- Phase 1 step 5: vector retrieval (guarded by runtime flag; TF-IDF remains the fallback) ----
+let USE_VECTOR_RETRIEVAL = ['1','true','on','vector'].includes(String(process.env.USE_VECTOR_RETRIEVAL||'').toLowerCase());
+const getVecStmt = db.prepare('SELECT vec FROM memory_vectors WHERE memory_id = ?');
+console.log(`[memory] retrieval mode at boot: ${USE_VECTOR_RETRIEVAL ? 'VECTOR' : 'tfidf'}`);
+
+function cosineVec(q, blob) {
+  const v = new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+  let d = 0, nq = 0, nv = 0;
+  const n = Math.min(q.length, v.length);
+  for (let i = 0; i < n; i++) { d += q[i]*v[i]; nq += q[i]*q[i]; nv += v[i]*v[i]; }
+  return nq && nv ? d / (Math.sqrt(nq) * Math.sqrt(nv)) : 0;
+}
+
+// Scores rows by cosine against qv. Returns null (→ caller falls back to TF-IDF)
+// if >20% of candidate rows lack vectors, so partial-backfill states stay safe.
+function scoreByVector(qv, rows, withRecency = false) {
+  if (!rows.length) return [];
+  const out = []; let missing = 0;
+  for (const m of rows) {
+    const vr = getVecStmt.get(m.id);
+    if (!vr || !vr.vec) { missing++; continue; }
+    const recencyBoost = withRecency && (Date.now() - new Date(m.created_at).getTime() < 86400000) ? 0.05 : 0;
+    out.push({ ...m, similarity: cosineVec(qv, vr.vec) + recencyBoost });
+  }
+  if (missing / rows.length > 0.2) return null;
+  return out.sort((a, b) => b.similarity - a.similarity);
+}
+
 // EMOTION VALENCE SCORING — maps emotions to positive/negative values
 function getEmotionValence(emotion) {
   const map = {
@@ -1060,6 +1088,49 @@ app.post('/api/memories/backfill-vectors', async (req, res) => {
   res.json({ embedded, errors, vectors, remaining });
 });
 
+// Phase 1 step 5/6: runtime retrieval-mode toggle (instant flip + instant revert, no redeploy).
+// Boot default comes from env USE_VECTOR_RETRIEVAL; a restart therefore reverts to the env setting.
+app.post('/api/memories/retrieval-mode', (req, res) => {
+  if (!process.env.EXPORT_TOKEN || req.query.token !== process.env.EXPORT_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const set = String(req.query.set || '').toLowerCase();
+  if (set === 'vector') USE_VECTOR_RETRIEVAL = true;
+  else if (set === 'tfidf') USE_VECTOR_RETRIEVAL = false;
+  if (set) console.log(`[memory] retrieval mode now: ${USE_VECTOR_RETRIEVAL ? 'VECTOR' : 'tfidf'}`);
+  res.json({ mode: USE_VECTOR_RETRIEVAL ? 'vector' : 'tfidf', boot_default_env: process.env.USE_VECTOR_RETRIEVAL || '(unset → tfidf)' });
+});
+
+// Phase 1 step 6: eval gate against the LIVE vector scorer. POST {queries:[{id,tier,query}]}.
+app.post('/api/memories/eval-retrieval', async (req, res) => {
+  if (!process.env.EXPORT_TOKEN || req.query.token !== process.env.EXPORT_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const queries = req.body && req.body.queries;
+    if (!Array.isArray(queries) || !queries.length) return res.status(400).json({ error: 'queries[] required' });
+    const tierRows = {
+      core: db.prepare("SELECT id, memory, created_at FROM memories WHERE user_id='andrew' AND tier='core'").all(),
+      long_term: db.prepare("SELECT id, memory, created_at FROM memories WHERE user_id='andrew' AND tier='long_term'").all(),
+      episodic: db.prepare("SELECT id, memory, created_at FROM memories WHERE user_id='andrew' AND tier='episodic'").all(),
+    };
+    let r1=0,r5=0,r10=0,mrr=0,lat=0; const per=[];
+    for (const q of queries) {
+      const t0 = Date.now();
+      const qv = await embedText(q.query);
+      const ranked = scoreByVector(qv, tierRows[q.tier] || []);
+      lat += Date.now() - t0;
+      const rank = ranked ? ranked.findIndex(m => m.id === q.id) + 1 : 0;
+      if (rank === 1) r1++; if (rank > 0 && rank <= 5) r5++; if (rank > 0 && rank <= 10) r10++; if (rank > 0) mrr += 1/rank;
+      per.push({ id: q.id, tier: q.tier, rank });
+    }
+    const n = queries.length;
+    const summary = { recall_at_1:+(r1/n).toFixed(3), recall_at_5:+(r5/n).toFixed(3), recall_at_10:+(r10/n).toFixed(3), mrr:+(mrr/n).toFixed(3), mean_ms: Math.round(lat/n) };
+    for (const t of ['core','long_term','episodic']) {
+      const tq = per.filter(x => x.tier === t);
+      if (tq.length) summary['recall_at_5_' + t] = +(tq.filter(x => x.rank > 0 && x.rank <= 5).length / tq.length).toFixed(3);
+    }
+    summary.gate_pass = summary.recall_at_5 >= 0.75 && (summary.recall_at_5_episodic || 0) >= 0.70;
+    res.json({ summary, per_query: per });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Direct memory save endpoint — used by Cognitive Core's memory extraction system
 app.post('/api/memories', (req, res) => {
   const { memory, category, importance, user_id } = req.body;
@@ -1161,7 +1232,7 @@ function cosineSim(a, b) {
 }
 
 // Tier-aware retrieval
-function retrieveRelevantMemories(query, maxCore = 5, maxLongTerm = 3, maxShortTerm = 3, maxRelevant = 3) {
+async function retrieveRelevantMemories(query, maxCore = 5, maxLongTerm = 3, maxShortTerm = 3, maxRelevant = 3) {
   const currentSession = getSessionNumber();
   const shortTermThreshold = Math.max(0, currentSession - 3); // last 3 sessions
 
@@ -1189,7 +1260,22 @@ function retrieveRelevantMemories(query, maxCore = 5, maxLongTerm = 3, maxShortT
   let scoredLongTerm = longTermAll.slice(0, maxLongTerm);
   let scoredRelevant = olderEpisodic.slice(0, maxRelevant);
 
-  if (query && query.trim().length >= 3) {
+  let vectorDone = false;
+  if (USE_VECTOR_RETRIEVAL && query && query.trim().length >= 3) {
+    try {
+      const qv = await embedText(query);
+      const ltV = scoreByVector(qv, longTermAll);
+      const epV = scoreByVector(qv, olderEpisodic, true);
+      if (ltV && epV) {
+        scoredLongTerm = ltV.slice(0, maxLongTerm);
+        scoredRelevant = epV.slice(0, maxRelevant);
+        vectorDone = true;
+      }
+    } catch (e) {
+      console.error(`[memory] vector retrieval failed → TF-IDF fallback: ${e.message}`);
+    }
+  }
+  if (!vectorDone && query && query.trim().length >= 3) {
     const idf = computeIDF();
     const queryVec = embed(query, idf);
 
@@ -1236,17 +1322,21 @@ function retrieveRelevantMemories(query, maxCore = 5, maxLongTerm = 3, maxShortT
 }
 
 // Smart retrieval endpoint
-app.post('/api/memories/relevant', (req, res) => {
+app.post('/api/memories/relevant', async (req, res) => {
   const { query, max_core, max_long_term, max_short_term, max_relevant } = req.body;
-  const result = retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3);
+  let result;
+  try { result = await retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3); }
+  catch (e) { console.error(`[memory] /relevant error: ${e.message}`); return res.status(500).json({ error: e.message }); }
   console.log(`[MEMORY] Query: "${(query || '').slice(0, 40)}" → ${result.core.length} core + ${result.long_term.length} LT + ${result.short_term.length} ST + ${result.relevant.length} rel (${result.total} total)`);
   res.json(result);
 });
 
 // Formatted context — ready to inject into system prompt
-app.post('/api/memories/context', (req, res) => {
+app.post('/api/memories/context', async (req, res) => {
   const { query, max_core, max_long_term, max_short_term, max_relevant } = req.body;
-  const r = retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3);
+  let r;
+  try { r = await retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3); }
+  catch (e) { console.error(`[memory] /context error: ${e.message}`); return res.status(500).json({ error: e.message }); }
 
   let context = '';
   if (r.core.length > 0) {
