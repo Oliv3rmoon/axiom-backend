@@ -127,6 +127,21 @@ try { db.exec("ALTER TABLE memories ADD COLUMN tier TEXT DEFAULT 'episodic'"); }
 try { db.exec("ALTER TABLE memories ADD COLUMN consolidated_from TEXT DEFAULT NULL"); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN session_number INTEGER DEFAULT 0"); } catch {}
 
+// Phase 1 (AXIOM 2.0): dense-vector index for memories. ADDITIVE ONLY —
+// retrieval stays TF-IDF until USE_VECTOR_RETRIEVAL flips after prod eval.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_vectors (
+    memory_id INTEGER PRIMARY KEY,
+    vec BLOB NOT NULL,
+    model TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+try {
+  const _mvCount = db.prepare('SELECT COUNT(*) AS n FROM memory_vectors').get().n;
+  console.log(`[memory] memory_vectors table ready (${_mvCount} vectors)`);
+} catch (e) { console.error('[memory] memory_vectors init check failed:', e.message); }
+
 // Session counter — increments each time a conversation starts
 db.exec(`CREATE TABLE IF NOT EXISTS session_counter (id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)`);
 try { db.exec("INSERT OR IGNORE INTO session_counter (id, count) VALUES (1, 0)"); } catch {}
