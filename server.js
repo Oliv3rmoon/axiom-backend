@@ -142,6 +142,19 @@ try {
   console.log(`[memory] memory_vectors table ready (${_mvCount} vectors)`);
 } catch (e) { console.error('[memory] memory_vectors init check failed:', e.message); }
 
+// Item 15 (AXIOM 2.0): persona stabilization — versioned self-model
+db.exec(`
+  CREATE TABLE IF NOT EXISTS self_model (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    drift REAL,
+    source TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 // Session counter — increments each time a conversation starts
 db.exec(`CREATE TABLE IF NOT EXISTS session_counter (id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)`);
 try { db.exec("INSERT OR IGNORE INTO session_counter (id, count) VALUES (1, 0)"); } catch {}
@@ -1154,6 +1167,36 @@ app.get('/api/memories/duplicates', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Item 15: self-model routes — versioned, drift measured via embeddings between versions
+app.post('/api/self-model', async (req, res) => {
+  try {
+    const { content, summary, source } = req.body || {};
+    if (!content || !summary) return res.status(400).json({ error: 'content and summary required' });
+    const prev = db.prepare('SELECT * FROM self_model ORDER BY version DESC LIMIT 1').get();
+    let drift = null;
+    if (prev) {
+      try {
+        const [a, b] = await Promise.all([embedText(JSON.stringify(content).slice(0,8000)), embedText(prev.content.slice(0,8000))]);
+        let d=0,na=0,nb=0; for (let i=0;i<Math.min(a.length,b.length);i++){d+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
+        drift = +(1 - (na&&nb ? d/(Math.sqrt(na)*Math.sqrt(nb)) : 0)).toFixed(4);
+      } catch (e) { console.error('[self-model] drift embed failed:', e.message); }
+    }
+    const version = (prev ? prev.version : 0) + 1;
+    db.prepare('INSERT INTO self_model (version, content, summary, drift, source) VALUES (?,?,?,?,?)')
+      .run(version, JSON.stringify(content), String(summary).slice(0,2000), drift, source || 'unknown');
+    console.log(`[self-model] v${version} stored (drift ${drift === null ? 'n/a' : drift})`);
+    res.json({ version, drift });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/self-model', (req, res) => {
+  const m = db.prepare('SELECT * FROM self_model ORDER BY version DESC LIMIT 1').get();
+  if (!m) return res.json({ version: null });
+  res.json({ version: m.version, content: JSON.parse(m.content), summary: m.summary, drift: m.drift, created_at: m.created_at, source: m.source });
+});
+app.get('/api/self-model/history', (req, res) => {
+  res.json({ versions: db.prepare('SELECT version, drift, source, created_at, summary FROM self_model ORDER BY version DESC LIMIT 20').all() });
+});
+
 // Direct memory save endpoint — used by Cognitive Core's memory extraction system
 app.post('/api/memories', (req, res) => {
   const { memory, category, importance, user_id } = req.body;
@@ -1378,6 +1421,14 @@ app.post('/api/memories/context', async (req, res) => {
     context += '\n\nRELEVANT TO NOW:\n';
     context += r.relevant.map(m => `• [${m.category}] ${m.memory}`).join('\n');
   }
+  // Item 15: self-model consumer — OFF until SELF_MODEL_IN_CONTEXT=1 (eval-gated)
+  if (['1','true','on'].includes(String(process.env.SELF_MODEL_IN_CONTEXT||'').toLowerCase())) {
+    try {
+      const sm = db.prepare('SELECT summary, version FROM self_model ORDER BY version DESC LIMIT 1').get();
+      if (sm) context += `\n\nWHO I AM (self-model v${sm.version}):\n${sm.summary}`;
+    } catch (e) { console.error('[memory] self-model inject failed:', e.message); }
+  }
+
   // Item 8: lessons consumer — OFF until LESSONS_IN_CONTEXT=1 (eval-gated)
   if (['1','true','on'].includes(String(process.env.LESSONS_IN_CONTEXT||'').toLowerCase())) {
     try {
