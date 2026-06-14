@@ -1520,6 +1520,16 @@ app.post('/api/memories/context', async (req, res) => {
   // Relational State (NOW / PATTERN / PREDICT) — flag-gated; '' when off
   try { context += buildRelationalState(conversation_id, predict); } catch (e) { console.error('[memory] relational inject failed:', e.message); }
 
+  // Open commitments — promises AXIOM made, surfaced for follow-through (flag-gated)
+  if (flagOn('COMMITMENTS_IN_CONTEXT')) {
+    try {
+      const open = db.prepare("SELECT promise FROM commitments WHERE status = 'open' ORDER BY created_at DESC LIMIT 5").all();
+      if (open.length > 0) {
+        context += '\n\nOPEN PROMISES TO ANDREW (follow through on these, or own it if you can’t):\n' + open.map(c => `• ${c.promise}`).join('\n');
+      }
+    } catch (e) { console.error('[memory] commitments inject failed:', e.message); }
+  }
+
   const remaining = r.total - r.core.length - r.long_term.length - r.short_term.length - r.relevant.length;
   if (remaining > 0) {
     context += `\n\n[${remaining} other memories stored — use recall_memory tool to search for specific ones]`;
