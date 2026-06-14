@@ -1758,6 +1758,18 @@ app.get('/api/internal-states', (req, res) => { res.json({ states: db.prepare('S
 app.get('/api/perceptions', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log ORDER BY created_at DESC LIMIT 100').all() }); });
 app.get('/api/perceptions/:id', (req, res) => { res.json({ perceptions: db.prepare('SELECT * FROM perception_log WHERE conversation_id = ? ORDER BY created_at ASC').all(req.params.id) }); });
 // Item 8: most recent conversation's transcript (for sleep-time lesson extraction)
+// List all Tavus transcript conversations (id + turn count + time span) so the
+// ICEM replay-eval (and any tooling) can enumerate the full Tavus history.
+app.get('/api/transcripts', (req, res) => {
+  const rows = db.prepare(`
+    SELECT conversation_id, COUNT(*) AS turns,
+           MIN(created_at) AS started, MAX(created_at) AS ended
+    FROM transcripts
+    GROUP BY conversation_id
+    ORDER BY MAX(created_at) DESC`).all();
+  res.json({ conversations: rows, count: rows.length });
+});
+
 app.get('/api/transcripts/latest', (req, res) => {
   const last = db.prepare('SELECT conversation_id FROM transcripts ORDER BY created_at DESC LIMIT 1').get();
   if (!last) return res.json({ conversation_id: null, transcript: [] });
