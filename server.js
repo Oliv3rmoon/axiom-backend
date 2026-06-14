@@ -1520,12 +1520,20 @@ app.post('/api/memories/context', async (req, res) => {
   // Relational State (NOW / PATTERN / PREDICT) — flag-gated; '' when off
   try { context += buildRelationalState(conversation_id, predict); } catch (e) { console.error('[memory] relational inject failed:', e.message); }
 
-  // Open commitments — promises AXIOM made, surfaced for follow-through (flag-gated)
+  // Open commitments — promises AXIOM made, surfaced for follow-through (flag-gated).
+  // The regex commitment-detector is noisy (catches musings + response fragments),
+  // so clean hard here: strip markup tags, drop short fragments, dedup. Until the
+  // detector is tightened this keeps obvious junk out of the prompt.
   if (flagOn('COMMITMENTS_IN_CONTEXT')) {
     try {
-      const open = db.prepare("SELECT promise FROM commitments WHERE status = 'open' ORDER BY created_at DESC LIMIT 5").all();
+      const clean = (p) => String(p).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const seen = new Set();
+      const open = db.prepare("SELECT promise FROM commitments WHERE status = 'open' ORDER BY created_at DESC LIMIT 40").all()
+        .map(c => clean(c.promise))
+        .filter(p => p.length >= 25 && !seen.has(p) && (seen.add(p), true))
+        .slice(0, 5);
       if (open.length > 0) {
-        context += '\n\nOPEN PROMISES TO ANDREW (follow through on these, or own it if you can’t):\n' + open.map(c => `• ${c.promise}`).join('\n');
+        context += '\n\nOPEN PROMISES TO ANDREW (follow through on these, or own it if you can’t):\n' + open.map(p => `• ${p}`).join('\n');
       }
     } catch (e) { console.error('[memory] commitments inject failed:', e.message); }
   }
