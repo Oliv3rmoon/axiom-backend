@@ -2600,6 +2600,16 @@ app.post('/api/commitments/:id/complete', (req, res) => {
   res.json({ success: true });
 });
 
+// Archive all currently-open commitments (e.g., the pre-detector-fix backlog) so
+// only cleanly-detected promises surface in context. Reversible — sets status,
+// does not delete; rows stay queryable via ?status=archived.
+app.post('/api/commitments/archive-open', (req, res) => {
+  const before = db.prepare("SELECT COUNT(*) AS c FROM commitments WHERE status = 'open'").get().c;
+  db.prepare("UPDATE commitments SET status = 'archived' WHERE status = 'open'").run();
+  console.log(`[COMMITMENTS] Archived ${before} open commitment(s)`);
+  res.json({ archived: before });
+});
+
 // CATCH-ALL for any other POST
 app.post('*', (req, res) => {
   console.log(`\n[CATCH-ALL] POST to ${req.path}`);
