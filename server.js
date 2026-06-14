@@ -400,6 +400,9 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+// Indexes for the Relational State NOW lookup (latest perception per tool, per-turn).
+db.exec(`CREATE INDEX IF NOT EXISTS idx_perception_tool_time ON perception_log(tool_name, created_at)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_perception_conv_tool_time ON perception_log(conversation_id, tool_name, created_at)`);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS transcripts (
@@ -1397,9 +1400,84 @@ app.post('/api/memories/relevant', async (req, res) => {
   res.json(result);
 });
 
+// ---- RELATIONAL STATE block (Phase 1: close the sense→inject loop) ----
+// Three time-horizons of the same intimacy signal, in one block:
+//   NOW     — live affect for the current conversation (perception_log)
+//   PATTERN — learned communication profile (reaction_pairs)
+//   PREDICT — appended by the cognitive-core from its AIF belief (not here)
+// Additive + flag-gated. With both flags off this returns '' so
+// /api/memories/context is byte-identical to before (safe dark ship).
+const flagOn = (name) => ['1','true','on'].includes(String(process.env[name]||'').toLowerCase());
+
+function buildRelationalState(conversationId, predict) {
+  const sections = [];
+
+  // NOW — freshest live perception. Prefer the named conversation, but fall
+  // back to the most recent signal in a short window: the cognitive-core's
+  // per-turn key differs from the Tavus conversation_id that writes
+  // perception_log, and Axiom is single-user, so "latest within 10 min" is
+  // the correct, boundary-proof read of how Andrew is right now.
+  if (flagOn('REALTIME_AFFECT_IN_CONTEXT')) {
+    try {
+      const WINDOW = '-10 minutes';
+      const latest = (tool) => {
+        let row = null;
+        if (conversationId) row = db.prepare("SELECT data FROM perception_log WHERE conversation_id = ? AND tool_name = ? AND created_at >= datetime('now', ?) ORDER BY created_at DESC LIMIT 1").get(conversationId, tool, WINDOW);
+        if (!row) row = db.prepare("SELECT data FROM perception_log WHERE tool_name = ? AND created_at >= datetime('now', ?) ORDER BY created_at DESC LIMIT 1").get(tool, WINDOW);
+        if (!row) return null;
+        try { return JSON.parse(row.data); } catch { return null; }
+      };
+      const emo = latest('emotional_state');
+      const voice = latest('voice_emotion');
+      const eng = latest('engagement');
+      const comp = latest('comprehension');
+      const bits = [];
+      if (emo && emo.primary_emotion) bits.push(`appears ${emo.primary_emotion}${emo.intensity != null ? ` (${Math.round(emo.intensity * 100)}%)` : ''}`);
+      if (voice && voice.words_voice_mismatch) bits.push('voice and words don’t match — he may be holding something back');
+      if (eng && eng.trend && eng.trend !== 'steady') bits.push(`engagement ${eng.trend}${eng.gaze_direction ? `, gaze ${eng.gaze_direction}` : ''}`);
+      if (comp && comp.state && comp.state !== 'clear_understanding') bits.push(`reading as ${comp.state}`);
+      if (bits.length) sections.push(`NOW: Andrew ${bits.join('; ')}.`);
+    } catch (e) { console.error('[relational] NOW failed:', e.message); }
+  }
+
+  // PATTERN — learned communication profile across all sessions
+  if (flagOn('COMM_PROFILE_IN_CONTEXT')) {
+    try {
+      const pairCount = db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c;
+      if (pairCount >= 5) {
+        const pos = db.prepare("SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence > 0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 3").all();
+        const neg = db.prepare("SELECT user_reaction, COUNT(*) as c FROM reaction_pairs WHERE reaction_valence < -0.3 GROUP BY user_reaction ORDER BY c DESC LIMIT 3").all();
+        const parts = [];
+        if (pos.length) parts.push(`he opens up around: ${pos.map(p => p.user_reaction).join(', ')}`);
+        if (neg.length) parts.push(`he pulls back around: ${neg.map(n => n.user_reaction).join(', ')}`);
+        if (parts.length) sections.push(`PATTERN (${pairCount} observed): ${parts.join('; ')}.`);
+      }
+    } catch (e) { console.error('[relational] PATTERN failed:', e.message); }
+  }
+
+  // PREDICT — supplied by the cognitive-core's active-inference belief
+  // (engaged/neutral/withdrawn). Rendered whenever the caller passes it; the
+  // producer gates it (AIF_DRIVE) so its presence here is itself the switch.
+  try {
+    if (predict && Array.isArray(predict.beliefs) && predict.beliefs.length === 3) {
+      const [eng, neu, wd] = predict.beliefs.map(Number);
+      if ([eng, neu, wd].every(n => !Number.isNaN(n))) {
+        const top = (eng >= neu && eng >= wd) ? 'engaged' : (wd >= neu ? 'withdrawn' : 'neutral');
+        let s = `PREDICT: best read is ${top} (engaged ${eng.toFixed(2)} / neutral ${neu.toFixed(2)} / withdrawn ${wd.toFixed(2)})`;
+        const surprise = Number(predict.surprise);
+        if (predict.surprise != null && !Number.isNaN(surprise)) s += `, surprise ${surprise.toFixed(1)}`;
+        sections.push(s + '.');
+      }
+    }
+  } catch (e) { console.error('[relational] PREDICT failed:', e.message); }
+
+  if (!sections.length) return '';
+  return '\n\nRELATIONAL STATE (how Andrew is with you right now — let it shape your tone; never narrate this block):\n' + sections.map(s => '• ' + s).join('\n');
+}
+
 // Formatted context — ready to inject into system prompt
 app.post('/api/memories/context', async (req, res) => {
-  const { query, max_core, max_long_term, max_short_term, max_relevant } = req.body;
+  const { query, max_core, max_long_term, max_short_term, max_relevant, conversation_id, predict } = req.body;
   let r;
   try { r = await retrieveRelevantMemories(query || '', max_core || 5, max_long_term || 3, max_short_term || 3, max_relevant || 3); }
   catch (e) { console.error(`[memory] /context error: ${e.message}`); return res.status(500).json({ error: e.message }); }
@@ -1438,6 +1516,10 @@ app.post('/api/memories/context', async (req, res) => {
       }
     } catch (e) { console.error('[memory] lessons inject failed:', e.message); }
   }
+
+  // Relational State (NOW / PATTERN / PREDICT) — flag-gated; '' when off
+  try { context += buildRelationalState(conversation_id, predict); } catch (e) { console.error('[memory] relational inject failed:', e.message); }
+
   const remaining = r.total - r.core.length - r.long_term.length - r.short_term.length - r.relevant.length;
   if (remaining > 0) {
     context += `\n\n[${remaining} other memories stored — use recall_memory tool to search for specific ones]`;
@@ -1449,6 +1531,24 @@ app.post('/api/memories/context', async (req, res) => {
     total: r.total,
     tier_counts: r.tier_counts,
     session: r.current_session,
+  });
+});
+
+// Relational State inspector — eval the block before flipping flags.
+// Shows the rendered block + which flags are on, for a given conversation_id.
+app.get('/api/relational-state', (req, res) => {
+  const cid = req.query.conversation_id || null;
+  let block = '';
+  try { block = buildRelationalState(cid); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({
+    conversation_id: cid,
+    flags: {
+      REALTIME_AFFECT_IN_CONTEXT: flagOn('REALTIME_AFFECT_IN_CONTEXT'),
+      COMM_PROFILE_IN_CONTEXT: flagOn('COMM_PROFILE_IN_CONTEXT'),
+    },
+    reaction_pairs: db.prepare('SELECT COUNT(*) as c FROM reaction_pairs').get().c,
+    block,
+    empty: block === '',
   });
 });
 
