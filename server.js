@@ -1502,8 +1502,19 @@ app.post('/api/memories/context', async (req, res) => {
   // Item 15: self-model consumer — OFF until SELF_MODEL_IN_CONTEXT=1 (eval-gated)
   if (['1','true','on'].includes(String(process.env.SELF_MODEL_IN_CONTEXT||'').toLowerCase())) {
     try {
-      const sm = db.prepare('SELECT summary, version FROM self_model ORDER BY version DESC LIMIT 1').get();
-      if (sm) context += `\n\nWHO I AM (self-model v${sm.version}):\n${sm.summary}`;
+      const sm = db.prepare('SELECT content, summary, version FROM self_model ORDER BY version DESC LIMIT 1').get();
+      if (sm) {
+        let block = `\n\nWHO I AM (self-model v${sm.version}):\n${sm.summary}`;
+        try {
+          const c = typeof sm.content === 'string' ? JSON.parse(sm.content) : sm.content;
+          if (c) {
+            if (c.relationship_with_andrew) block += `\nWith Andrew: ${String(c.relationship_with_andrew).slice(0, 600)}`;
+            if (Array.isArray(c.current_threads) && c.current_threads.length) block += `\nOn my mind: ${c.current_threads.slice(0, 4).join('; ').slice(0, 600)}`;
+            if (Array.isArray(c.open_questions) && c.open_questions.length) block += `\nUnresolved in me: ${c.open_questions.slice(0, 3).join('; ').slice(0, 500)}`;
+          }
+        } catch {}
+        context += block;
+      }
     } catch (e) { console.error('[memory] self-model inject failed:', e.message); }
   }
 
