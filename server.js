@@ -1476,6 +1476,27 @@ function buildRelationalState(conversationId, predict) {
 }
 
 // Formatted context — ready to inject into system prompt
+// Relevance-gate a lesson against the current turn so only a topically-fitting, high-confidence
+// lesson reaches live conversation (vs. the old blunt top-3 dump). Confidence-weighted token
+// overlap; returns one lesson or null. Pure + testable.
+const LESSON_STOP = new Set('the a an to of and or is are was were i you it that this in on for with be been he she they we my your me him her our about what when how why not but so if as at do does did have has had just really like feel feels im its will can could would should'.split(' '));
+function lessonTokens(s) {
+  return new Set(String(s || '').toLowerCase().replace(/[^a-z0-9'\s]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !LESSON_STOP.has(w)));
+}
+function pickRelevantLesson(query, lessons) {
+  const q = lessonTokens(query);
+  if (q.size < 1 || !Array.isArray(lessons)) return null;
+  let best = null, bestScore = 0;
+  for (const l of lessons) {
+    const lt = lessonTokens((l.lesson || '') + ' ' + (l.context || ''));
+    let overlap = 0; for (const w of lt) if (q.has(w)) overlap++;
+    if (overlap < 1) continue;
+    const score = overlap * (0.5 + 0.5 * (l.confidence || 0.5));   // confidence-weighted overlap
+    if (score > bestScore) { bestScore = score; best = l; }
+  }
+  return bestScore >= 1.0 ? best : null;   // require a real (≥1 high-conf or ≥2-token) hit, not a weak single match
+}
+
 app.post('/api/memories/context', async (req, res) => {
   const { query, max_core, max_long_term, max_short_term, max_relevant, conversation_id, predict } = req.body;
   let r;
@@ -1521,9 +1542,12 @@ app.post('/api/memories/context', async (req, res) => {
   // Item 8: lessons consumer — OFF until LESSONS_IN_CONTEXT=1 (eval-gated)
   if (['1','true','on'].includes(String(process.env.LESSONS_IN_CONTEXT||'').toLowerCase())) {
     try {
-      const topLessons = db.prepare("SELECT lesson FROM lessons WHERE action_type = 'conversation' ORDER BY confidence DESC, created_at DESC LIMIT 3").all();
-      if (topLessons.length > 0) {
-        context += '\n\nLESSONS (from experience):\n' + topLessons.map(l => `\u2022 ${l.lesson}`).join('\n');
+      const cand = db.prepare(
+        "SELECT lesson, context, confidence FROM lessons WHERE confidence >= 0.6 AND (action_type IS NULL OR action_type NOT IN ('audit','propose_change','code','code_proposal','build_and_test','research','runpod','ssh','purchase','browse','local','attempted_jailbreak')) ORDER BY confidence DESC, created_at DESC LIMIT 80"
+      ).all();
+      const best = pickRelevantLesson(query, cand);
+      if (best) {
+        context += `\n\nLEARNED (from your own experience \u2014 let it shape how you respond, never recite it):\n\u2022 ${String(best.lesson).replace(/\s+/g, ' ').trim().slice(0, 180)}`;
       }
     } catch (e) { console.error('[memory] lessons inject failed:', e.message); }
   }
