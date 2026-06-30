@@ -262,6 +262,71 @@ db.exec(`
   )
 `);
 
+const skillColumns = new Set(db.prepare('PRAGMA table_info(skills)').all().map(c => c.name));
+function ensureSkillColumn(name, definition) {
+  if (!skillColumns.has(name)) {
+    db.exec(`ALTER TABLE skills ADD COLUMN ${name} ${definition}`);
+    skillColumns.add(name);
+  }
+}
+ensureSkillColumn('code', 'TEXT DEFAULT NULL');
+ensureSkillColumn('verified_on', 'TEXT DEFAULT NULL');
+ensureSkillColumn('language', "TEXT DEFAULT 'python'");
+ensureSkillColumn('purpose_embedding', 'BLOB DEFAULT NULL');
+ensureSkillColumn('metadata', 'TEXT DEFAULT NULL');
+
+function normalizeSkillJson(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
+function normalizeSkillEmbedding(value) {
+  if (value == null || value === '') return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (Array.isArray(value)) return Buffer.from(JSON.stringify(value));
+  if (typeof value === 'string') return Buffer.from(value);
+  return Buffer.from(JSON.stringify(value));
+}
+
+function parseSkillJson(value) {
+  if (value == null) return null;
+  const text = Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+function skillRow(row) {
+  if (!row) return row;
+  return {
+    ...row,
+    purpose_embedding: parseSkillJson(row.purpose_embedding),
+    metadata: parseSkillJson(row.metadata),
+  };
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) return null;
+  let dot = 0, aa = 0, bb = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = Number(a[i]);
+    const y = Number(b[i]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    dot += x * y; aa += x * x; bb += y * y;
+  }
+  if (!aa || !bb) return null;
+  return dot / (Math.sqrt(aa) * Math.sqrt(bb));
+}
+
+function parseQueryEmbedding(query) {
+  const raw = query.query_embedding || query.embedding || query.purpose_embedding;
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw.map(Number);
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(Number) : null;
+  } catch { return null; }
+}
+
 // Execution Plans — structured multi-step plans for goals
 db.exec(`
   CREATE TABLE IF NOT EXISTS execution_plans (
@@ -1945,15 +2010,31 @@ app.patch('/api/lessons/:id/applied', (req, res) => {
 
 // Save a skill
 app.post('/api/skills', (req, res) => {
-  const { skill_name, goal_pattern, approach, steps_template } = req.body;
+  const {
+    skill_name, goal_pattern, approach, steps_template,
+    code, verified_on, language, purpose_embedding, metadata,
+  } = req.body;
   if (!skill_name || !goal_pattern || !approach) return res.status(400).json({ error: 'skill_name, goal_pattern, approach required' });
-  const result = db.prepare('INSERT INTO skills (skill_name, goal_pattern, approach, steps_template) VALUES (?, ?, ?, ?)').run(skill_name, goal_pattern, approach, steps_template || null);
+  if (code && !verified_on) return res.status(400).json({ error: 'verified_on required when code is provided' });
+  const result = db.prepare(`INSERT INTO skills
+    (skill_name, goal_pattern, approach, steps_template, code, verified_on, language, purpose_embedding, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      skill_name,
+      goal_pattern,
+      approach,
+      steps_template || null,
+      code || null,
+      verified_on || null,
+      language || 'python',
+      normalizeSkillEmbedding(purpose_embedding),
+      normalizeSkillJson(metadata)
+    );
   res.json({ saved: true, id: result.lastInsertRowid });
 });
 
 // Get skills
 app.get('/api/skills', (req, res) => {
-  const skills = db.prepare('SELECT * FROM skills ORDER BY success_rate DESC, times_used DESC').all();
+  const skills = db.prepare('SELECT * FROM skills ORDER BY success_rate DESC, times_used DESC').all().map(skillRow);
   res.json({ skills, total: skills.length });
 });
 
@@ -1961,8 +2042,23 @@ app.get('/api/skills', (req, res) => {
 app.get('/api/skills/match', (req, res) => {
   const { goal } = req.query;
   if (!goal) return res.json({ skills: [] });
-  const skills = db.prepare("SELECT * FROM skills WHERE goal_pattern LIKE ? OR skill_name LIKE ? ORDER BY success_rate DESC LIMIT 5").all(`%${goal}%`, `%${goal}%`);
-  res.json({ skills });
+  const limit = Math.min(parseInt(req.query.limit) || 5, 20);
+  const embedding = parseQueryEmbedding(req.query);
+  if (embedding) {
+    const candidates = db.prepare('SELECT * FROM skills WHERE purpose_embedding IS NOT NULL').all()
+      .map(skillRow)
+      .map(s => ({ ...s, semantic_score: cosineSimilarity(embedding, s.purpose_embedding) }))
+      .filter(s => s.semantic_score != null)
+      .sort((a, b) => b.semantic_score - a.semantic_score)
+      .slice(0, limit);
+    if (candidates.length > 0) return res.json({ skills: candidates, match_mode: 'semantic' });
+  }
+  const skills = db.prepare(`
+    SELECT * FROM skills
+    WHERE goal_pattern LIKE ? OR skill_name LIKE ? OR approach LIKE ?
+    ORDER BY success_rate DESC, times_used DESC, created_at DESC
+    LIMIT ?`).all(`%${goal}%`, `%${goal}%`, `%${goal}%`, limit).map(skillRow);
+  res.json({ skills, match_mode: 'keyword' });
 });
 
 // Update skill outcome
